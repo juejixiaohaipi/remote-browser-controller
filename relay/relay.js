@@ -60,8 +60,11 @@ if (!TOKEN) {
 // ── Gateway reconnection config ─────────────────────────────────────────────
 const RECONNECT_BASE = 3000;
 const RECONNECT_MAX = 60000;
+const GW_PING_INTERVAL = 25000;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let gwPingTimer = null;
+let gwPongReceived = true;
 
 // ── Message queue for when gateway is disconnected ───────────────────────────
 const MSG_QUEUE_MAX = 100;
@@ -122,9 +125,13 @@ function connectToGateway() {
       token: TOKEN,
       ...auth
     }));
-    // Flush queued messages
-    flushMessageQueue();
+    // Notify extension that gateway is back
+    notifyExtension({ type: 'event', event: 'relay.gateway_connected', data: {} });
+    // Start heartbeat to detect dead gateway connections
+    startGwPing();
   });
+
+  relayConnection.on('pong', () => { gwPongReceived = true; });
 
   relayConnection.on('message', (data) => {
     try {
@@ -141,7 +148,15 @@ function connectToGateway() {
 
   relayConnection.on('close', (code, reason) => {
     log(`Gateway connection closed: code=${code} reason=${reason || 'none'}`);
+    stopGwPing();
     relayConnection = null;
+    // Notify extension that gateway is down
+    notifyExtension({ type: 'event', event: 'relay.gateway_disconnected', data: { code } });
+    // Clear stale queued messages — they'll timeout on extension side anyway
+    if (messageQueue.length > 0) {
+      log(`Discarding ${messageQueue.length} stale queued messages`);
+      messageQueue.length = 0;
+    }
     scheduleGatewayReconnect();
   });
 
@@ -149,6 +164,26 @@ function connectToGateway() {
     logError('Gateway connection error:', err.message);
     relayConnection?.close();
   });
+}
+
+function startGwPing() {
+  stopGwPing();
+  gwPongReceived = true;
+  gwPingTimer = setInterval(() => {
+    if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) { stopGwPing(); return; }
+    if (!gwPongReceived) {
+      log('Gateway pong timeout — terminating dead connection');
+      stopGwPing();
+      relayConnection.terminate();
+      return;
+    }
+    gwPongReceived = false;
+    relayConnection.ping();
+  }, GW_PING_INTERVAL);
+}
+
+function stopGwPing() {
+  if (gwPingTimer) { clearInterval(gwPingTimer); gwPingTimer = null; }
 }
 
 function scheduleGatewayReconnect() {
@@ -188,6 +223,13 @@ function sendToGateway(data) {
   }
 }
 
+// ── Notify extension (safe — only sends if connected) ────────────────────────
+function notifyExtension(msg) {
+  if (extensionConnection && extensionConnection.readyState === WebSocket.OPEN) {
+    try { extensionConnection.send(JSON.stringify(msg)); } catch {}
+  }
+}
+
 // Re-authenticate to gateway with new extension auth info
 function reauthToGateway() {
   if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) return;
@@ -218,18 +260,31 @@ const httpServer = http.createServer((req, res) => {
   }
 });
 
-// ── Extension heartbeat — detect dead connections early ──────────────────────
+// ── Extension heartbeat — detect dead connections via pong timeout ───────────
 const EXT_PING_INTERVAL = 25000;
+const EXT_PONG_TIMEOUT = 10000; // if no pong within 10s, consider dead
 let extPingTimer = null;
+let extPongReceived = true;
 
 function startExtPing(ws) {
   stopExtPing();
+  extPongReceived = true;
+
+  ws.on('pong', () => { extPongReceived = true; });
+
   extPingTimer = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.ping(); // WebSocket-level ping, auto-replied with pong by client
-    } else {
+    if (ws.readyState !== WebSocket.OPEN) { stopExtPing(); return; }
+
+    if (!extPongReceived) {
+      // Previous ping didn't get a pong — connection is dead
+      log('Extension pong timeout — terminating dead connection');
       stopExtPing();
+      ws.terminate();
+      return;
     }
+
+    extPongReceived = false;
+    ws.ping();
   }, EXT_PING_INTERVAL);
 }
 
