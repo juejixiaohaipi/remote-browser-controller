@@ -1,0 +1,22 @@
+[data-gtool-removed="true"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+input[type="password"] ~ [data-gtool-removed="true"],
+input[type="password"] + [data-gtool-removed="true"],
+input[type="password"] ~ * [data-gtool-removed="true"],
+input[type="password"] + * [data-gtool-removed="true"] {
+  display: none !important;
+}
+
+input[type="password"] ~ svg[data-gtool-removed="true"],
+input[type="password"] + svg[data-gtool-removed="true"],
+input[type="password"] ~ button[data-gtool-removed="true"],
+input[type="password"] + button[data-gtool-removed="true"],
+input[type="password"] ~ span[data-gtool-removed="true"],
+input[type="password"] + span[data-gtool-removed="true"] {
+  display: none !important;
+}

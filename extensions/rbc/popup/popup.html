@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Remote Browser Controller</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      width: 340px;
+      padding: 14px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h3 { font-size: 15px; margin-bottom: 12px; color: #fff; display: flex; align-items: center; gap: 6px; }
+
+    .status-bar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 12px; background: #16213e; border-radius: 8px; margin-bottom: 12px;
+    }
+    .status-dot {
+      width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+      background: #9E9E9E;
+    }
+    .status-dot.connected { background: #4CAF50; box-shadow: 0 0 6px #4CAF5080; }
+    .status-dot.connecting { background: #FFC107; animation: pulse 1s infinite; }
+    .status-dot.disconnected { background: #555; }
+    .status-dot.reconnecting { background: #FF9800; animation: pulse 1s infinite; }
+    .status-dot.error { background: #F44336; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .status-text { flex: 1; font-size: 12px; }
+    .status-badge { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #2a2a4a; color: #888; }
+
+    .info-strip {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+      margin-bottom: 12px;
+    }
+    .info-card {
+      background: #16213e; border-radius: 6px; padding: 8px 10px;
+    }
+    .info-card .label { font-size: 10px; color: #666; margin-bottom: 2px; }
+    .info-card .value { font-size: 12px; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .info-card .value.active { color: #4CAF50; }
+    .info-card .value.url { font-family: monospace; font-size: 10px; }
+
+    .input-group { margin-bottom: 10px; }
+    label { display: block; font-size: 11px; color: #888; margin-bottom: 4px; }
+    input {
+      width: 100%; padding: 8px 10px; border: 1px solid #2a2a4a; border-radius: 6px;
+      background: #16213e; color: #fff; font-size: 12px;
+    }
+    input:focus { outline: none; border-color: #4CAF50; }
+    input[type="password"] { font-family: monospace; }
+
+    .checkbox-group { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+    .checkbox-group input[type="checkbox"] { width: 14px; height: 14px; accent-color: #4CAF50; }
+    .checkbox-group label { margin: 0; font-size: 12px; color: #aaa; }
+
+    .quick-actions {
+      display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 12px;
+    }
+    .quick-btn {
+      padding: 7px 4px; border: none; border-radius: 6px; font-size: 11px;
+      cursor: pointer; transition: all 0.15s; text-align: center;
+    }
+    .quick-btn .icon { font-size: 16px; display: block; margin-bottom: 2px; }
+    .quick-btn.screenshot { background: #1e3a5f; color: #64b5f6; }
+    .quick-btn.screenshot:hover { background: #1e4a7a; }
+    .quick-btn.tabs { background: #1e3a2a; color: #81c784; }
+    .quick-btn.tabs:hover { background: #1e4a3a; }
+    .quick-btn.status { background: #2a2a1e; color: #fff176; }
+    .quick-btn.status:hover { background: #3a3a2a; }
+    .quick-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .button-group { display: flex; gap: 8px; margin-bottom: 10px; }
+    button {
+      flex: 1; padding: 9px 12px; border: none; border-radius: 6px;
+      font-size: 12px; font-weight: 500; cursor: pointer; transition: all 0.15s;
+    }
+    button.primary { background: #4CAF50; color: white; }
+    button.primary:hover { background: #45a049; }
+    button.danger { background: #2a2a2a; color: #F44336; border: 1px solid #F44336; }
+    button.danger:hover { background: #3a2020; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .divider { height: 1px; background: #2a2a4a; margin: 10px 0; }
+
+    .session-info {
+      background: #0f1923; border-radius: 6px; padding: 8px 10px;
+      font-size: 10px; margin-bottom: 10px;
+    }
+    .session-info .row { display: flex; gap: 8px; margin-bottom: 3px; }
+    .session-info .key { color: #666; width: 60px; flex-shrink: 0; }
+    .session-info .val { color: #aaa; font-family: monospace; word-break: break-all; }
+
+    .logs {
+      background: #0a0a18; border-radius: 6px; max-height: 120px;
+      overflow-y: auto; font-family: 'Courier New', monospace;
+      font-size: 10px; padding: 6px 8px;
+    }
+    .log-entry { padding: 2px 0; border-bottom: 1px solid #151528; color: #555; }
+    .log-entry:last-child { border-bottom: none; }
+    .log-entry .time { color: #444; margin-right: 6px; }
+    .log-entry.info { color: #4CAF50; }
+    .log-entry.error { color: #F44336; }
+    .log-entry.warn { color: #FF9800; }
+
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <h3>🌐 Remote Browser Controller</h3>
+
+  <!-- Status -->
+  <div class="status-bar">
+    <div class="status-dot disconnected" id="statusDot"></div>
+    <span class="status-text" id="statusText">Not connected</span>
+    <span class="status-badge" id="statusBadge">--</span>
+  </div>
+
+  <!-- Quick Info Strip -->
+  <div class="info-strip">
+    <div class="info-card">
+      <div class="label">Current Page</div>
+      <div class="value url" id="currentUrl" title="Current page URL">--</div>
+    </div>
+    <div class="info-card">
+      <div class="label">Tabs</div>
+      <div class="value active" id="tabCount">--</div>
+    </div>
+  </div>
+
+  <!-- Quick Actions -->
+  <div class="quick-actions">
+    <button class="quick-btn screenshot" id="qsScreenshot" disabled title="Capture current page">
+      <span class="icon">📸</span>Screenshot
+    </button>
+    <button class="quick-btn tabs" id="qsNewTab" disabled title="Open new tab">
+      <span class="icon">➕</span>New Tab
+    </button>
+    <button class="quick-btn status" id="qsRefresh" disabled title="Refresh connection status">
+      <span class="icon">↻</span>Refresh
+    </button>
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- Connection Config -->
+  <div class="input-group">
+    <label>Server URL (WebSocket)</label>
+    <input type="text" id="serverUrl" placeholder="ws://localhost:3000/ws">
+  </div>
+  <div class="input-group">
+    <label>Token</label>
+    <input type="password" id="token" placeholder="Enter token">
+  </div>
+  <div class="input-group">
+    <label>Device Name (optional)</label>
+    <input type="text" id="deviceName" placeholder="e.g. Chrome-US-01">
+  </div>
+  <div class="checkbox-group">
+    <input type="checkbox" id="autoConnect">
+    <label for="autoConnect">Auto-connect on startup</label>
+  </div>
+  <div class="button-group">
+    <button class="primary" id="connectBtn">Connect</button>
+    <button class="danger" id="disconnectBtn" disabled>Disconnect</button>
+  </div>
+
+  <!-- Session Info -->
+  <div class="session-info" id="sessionInfo" style="display: none;">
+    <div class="row"><span class="key">Session</span><span class="val" id="sessId">--</span></div>
+    <div class="row"><span class="key">Device</span><span class="val" id="sessDevice">--</span></div>
+    <div class="row"><span class="key">Device ID</span><span class="val" id="sessDeviceId">--</span></div>
+    <div class="row"><span class="key">Token</span><span class="val" id="sessToken">--</span></div>
+  </div>
+
+  <!-- Log -->
+  <div class="logs" id="logContainer">
+    <div class="log-entry"><span class="time">--:--:--</span>Extension loaded</div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
