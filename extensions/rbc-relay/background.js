@@ -334,10 +334,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete' && tab.url && tab.url.startsWith('http')) {
-    sendToRelay({
-      type: 'event',
-      event: 'page.loaded',
-      data: { url: tab.url, title: tab.title, tabId }
+    chrome.tabs.query({ currentWindow: true }).then(tabs => {
+      sendToRelay({
+        type: 'event',
+        event: 'page.loaded',
+        data: { url: tab.url, title: tab.title, tabId, tabCount: tabs.length }
+      });
     });
   }
 });
