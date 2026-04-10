@@ -186,6 +186,7 @@ class RBCConnectionManager {
       this.connected = false;
       this.sessionId = null;
       this._stopHeartbeat();
+      this._clearPendingCommands();
       this._updateStatus('disconnected', `Connection closed (${code})`);
       this._scheduleReconnect();
     });
@@ -203,11 +204,8 @@ class RBCConnectionManager {
       this._handleMessage(msg);
     });
 
-    // Route messages from content scripts and popup
-    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-      this._handleCommand(msg.type, msg.id, msg.method, msg.params, sendResponse);
-      return true;
-    });
+    // NOTE: popup/content messages are handled by the global onMessage listener below.
+    // Only gateway commands (from _handleMessage) call _handleCommand.
   }
 
   async loadConfig() {
@@ -278,39 +276,7 @@ class RBCConnectionManager {
       case 'event': this._handleEvent(msg.event, msg.data); break;
       case 'command': {
         console.log('[RBC] _handleMessage command:', msg.method, 'id:', msg.id);
-        // Handle browser.navigate and browser.snapshot locally (Chrome tab API)
-        if (msg.method === 'browser.navigate') {
-          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-            if (tabs[0]?.id) {
-              chrome.tabs.update(tabs[0].id, { url: msg.params.url }, () => {
-                this._send({ type: 'command_response', id: msg.id, result: { success: true } });
-              });
-            } else {
-              this._send({ type: 'command_response', id: msg.id, error: { code: -32000, message: 'No active tab' } });
-            }
-          });
-          break;
-        }
-        if (msg.method === 'browser.snapshot') {
-          console.log('[RBC] browser.snapshot command received, msg.id:', msg.id);
-          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-            console.log('[RBC] active tab:', tabs[0]?.id, tabs[0]?.url);
-            if (!tabs[0]?.id) {
-              this._send({ type: 'command_response', id: msg.id, error: { code: -32000, message: 'No active tab' } });
-              return;
-            }
-            chrome.tabs.sendMessage(tabs[0].id, { type: 'browser.snapshot', params: msg.params }, (resp) => {
-              console.log('[RBC] sendMessage resp, lastError:', chrome.runtime.lastError?.message, 'resp:', !!resp);
-              if (chrome.runtime.lastError) {
-                this._send({ type: 'command_response', id: msg.id, error: { code: -32000, message: chrome.runtime.lastError.message } });
-              } else {
-                this._send({ type: 'command_response', id: msg.id, result: resp });
-              }
-            });
-          });
-          break;
-        }
-        // All other commands: send to content script via _handleCommand
+        // All commands (browser.navigate, browser.snapshot, etc.) go through unified _handleCommand
         this._handleCommand(msg.id, msg.method, msg.params, (response) => {
           this._send({ type: 'command_response', id: msg.id, ...response });
         });
@@ -335,12 +301,24 @@ class RBCConnectionManager {
 
   disconnect() {
     this._stopHeartbeat();
+    this._clearPendingCommands();
     this.sessionId = null;
     this.connected = false;
     this.reconnectAttempts = 0;
     this._offscreen.disconnect().catch(() => {});
     this._broadcast({ type: 'status', status: 'disconnected', text: 'Disconnected' });
     this._updateStatus('disconnected', 'Disconnected');
+  }
+
+  _clearPendingCommands() {
+    for (const [id, waiter] of this._commandWaiters) {
+      clearTimeout(waiter.timeout);
+      if (!waiter.responded) {
+        waiter.responded = true;
+        try { waiter.sendResponse({ id, error: { code: -32000, message: 'Disconnected' } }); } catch {}
+      }
+    }
+    this._commandWaiters.clear();
   }
 
   _handleCommandResponse(id, result, error) {
@@ -381,7 +359,7 @@ class RBCConnectionManager {
   }
 
   _handleCommand(id, method, params, sendResponse) {
-    // Handle browser.navigate locally — no need to go to content script
+    // Handle browser.navigate locally via Chrome tab API
     if (method === 'browser.navigate') {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs[0]?.id) {
@@ -395,6 +373,25 @@ class RBCConnectionManager {
       return;
     }
 
+    // Handle browser.snapshot locally — forward to content script directly
+    if (method === 'browser.snapshot') {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (!tabs[0]?.id) {
+          try { sendResponse({ id, error: { code: -32000, message: 'No active tab' } }); } catch {}
+          return;
+        }
+        chrome.tabs.sendMessage(tabs[0].id, { type: 'browser.snapshot', params }, (resp) => {
+          if (chrome.runtime.lastError) {
+            try { sendResponse({ id, error: { code: -32000, message: chrome.runtime.lastError.message } }); } catch {}
+          } else {
+            try { sendResponse({ id, result: resp }); } catch {}
+          }
+        });
+      });
+      return;
+    }
+
+    // All other commands: forward to content script via gateway round-trip
     let responded = false;
     const timeout = setTimeout(() => {
       if (!responded) {

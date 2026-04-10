@@ -6,16 +6,10 @@
   "permissions": [
     "activeTab",
     "tabs",
-    "tabCapture",
     "webNavigation",
     "downloads",
     "storage",
-    "notifications",
-    "scripting",
-    "geolocation",
-    "alarms",
-    "offscreen",
-    "debugger"
+    "offscreen"
   ],
   "host_permissions": [
     "<all_urls>"

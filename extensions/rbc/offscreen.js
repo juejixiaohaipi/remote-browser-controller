@@ -49,7 +49,9 @@ function connect(serverUrl, token, deviceId, deviceName) {
     try {
       const msg = JSON.parse(event.data);
       sendToBg('message', { msg });
-    } catch {}
+    } catch (err) {
+      console.warn('[Offscreen] Failed to parse WebSocket message:', err.message, event.data?.slice?.(0, 200));
+    }
   };
 
   wss.onclose = (event) => {
