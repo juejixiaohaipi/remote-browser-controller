@@ -24,6 +24,11 @@ function scheduleReconnect() {
 }
 
 function connect(serverUrl, token, deviceId, deviceName) {
+  // If already connecting or connected, skip
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+    console.log('[Offscreen] connect skipped: existing ws still active');
+    return;
+  }
   if (ws) { ws.close(); ws = null; }
   let wss;
   try {
@@ -33,16 +38,18 @@ function connect(serverUrl, token, deviceId, deviceName) {
     scheduleReconnect();
     return;
   }
-  ws = wss;
-
-  ws.onopen = () => {
+  // Set up handlers BEFORE assigning to ws (prevents stale onopen firing on old ws)
+  wss.onopen = () => {
     reconnectAttempts = 0;
     sendToBg('connected', {});
-    ws.send(JSON.stringify({
-      type: 'auth', token, deviceId,
-      deviceName: deviceName || `Chrome-${deviceId?.slice(0, 8)}`,
-      browserType: 'chrome', tags: ['chrome-extension', 'offscreen']
-    }));
+    // Only send if this specific WebSocket instance is still the active one
+    if (wss.readyState === WebSocket.OPEN && wss === ws) {
+      wss.send(JSON.stringify({
+        type: 'auth', token, deviceId,
+        deviceName: deviceName || `Chrome-${deviceId?.slice(0, 8)}`,
+        browserType: 'chrome', tags: ['chrome-extension', 'offscreen']
+      }));
+    }
   };
 
   wss.onmessage = (event) => {
@@ -56,14 +63,16 @@ function connect(serverUrl, token, deviceId, deviceName) {
 
   wss.onclose = (event) => {
     sendToBg('disconnected', { code: event.code });
-    ws = null;
+    if (wss === ws) ws = null;
     scheduleReconnect();
   };
 
   wss.onerror = () => {
     sendToBg('error', { message: 'WebSocket error' });
-    ws?.close();
+    wss?.close();
   };
+
+  ws = wss;
 }
 
 let savedConfig = null;
