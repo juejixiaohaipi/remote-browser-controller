@@ -1,18 +1,15 @@
-// offscreen.js — WebSocket lives here, survives service worker kills
-// Background SW talks to this via MessagePort (chrome.runtime.connect)
-// IMPORTANT: This is the ONLY place that manages the WebSocket lifecycle.
-// Background should NOT have its own reconnect loop.
+// offscreen.js — WebSocket lives here, survives Service Worker kills
+// Background SW communicates via chrome.runtime.connect (MessagePort)
 
 let ws = null;
 let reconnectAttempts = 0;
 let bgPort = null;
-let pingTimer = null;
-let reconnectTimer = null;
 let savedConfig = null;
+let pingTimer = null;
 
-const RECONNECT_BASE = 3000;
-const RECONNECT_MAX = 15000;
-const PING_INTERVAL = 25000;
+const RECONNECT_BASE = 2000;
+const RECONNECT_MAX = 30000;
+const PING_INTERVAL = 25000; // keep WebSocket alive
 
 function sendToBg(type, data = {}) {
   if (!bgPort) return;
@@ -34,49 +31,24 @@ function stopPing() {
   if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
 }
 
-function cancelReconnect() {
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-}
-
 function scheduleReconnect() {
-  cancelReconnect();
   reconnectAttempts++;
   const delay = Math.min(RECONNECT_BASE * Math.pow(2, reconnectAttempts - 1), RECONNECT_MAX);
   sendToBg('reconnecting', { delay, attempt: reconnectAttempts });
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    if (savedConfig) connect.apply(null, savedConfig);
+  setTimeout(() => {
+    if (savedConfig) connect(savedConfig.relayPort, savedConfig.token, savedConfig.deviceId, savedConfig.deviceName);
   }, delay);
 }
 
-/** Report current connection state to background (used after SW restart) */
-function reportStatus() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    sendToBg('connected', {});
-  } else if (ws && ws.readyState === WebSocket.CONNECTING) {
-    sendToBg('reconnecting', { delay: 0, attempt: reconnectAttempts });
-  } else {
-    sendToBg('disconnected', { code: 0 });
-  }
-}
-
-function connect(serverUrl, token, deviceId, deviceName) {
-  // If already connected, just report status (handles SW restart case)
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    console.log('[Offscreen] connect: already connected, reporting status');
-    reportStatus();
-    return;
-  }
-  // If already connecting, wait for it
-  if (ws && ws.readyState === WebSocket.CONNECTING) {
-    console.log('[Offscreen] connect: already connecting, skipping');
+function connect(relayPort, token, deviceId, deviceName) {
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
     return;
   }
   if (ws) { ws.close(); ws = null; }
 
   let wss;
   try {
-    wss = new WebSocket(serverUrl);
+    wss = new WebSocket(`ws://127.0.0.1:${relayPort}`);
   } catch (err) {
     sendToBg('error', { message: err.message });
     scheduleReconnect();
@@ -85,14 +57,17 @@ function connect(serverUrl, token, deviceId, deviceName) {
 
   wss.onopen = () => {
     reconnectAttempts = 0;
-    cancelReconnect();
     sendToBg('connected', {});
     startPing();
+    // Authenticate with relay
     if (wss.readyState === WebSocket.OPEN && wss === ws) {
       wss.send(JSON.stringify({
-        type: 'auth', token, deviceId,
+        type: 'auth',
+        token,
+        deviceId,
         deviceName: deviceName || `Chrome-${deviceId?.slice(0, 8)}`,
-        browserType: 'chrome', tags: ['chrome-extension', 'offscreen']
+        browserType: 'chrome',
+        tags: ['rbc-relay', 'offscreen']
       }));
     }
   };
@@ -110,10 +85,7 @@ function connect(serverUrl, token, deviceId, deviceName) {
     stopPing();
     sendToBg('disconnected', { code: event.code });
     if (wss === ws) ws = null;
-    // Only auto-reconnect if we have config and weren't explicitly stopped
-    if (savedConfig && reconnectAttempts < 9999) {
-      scheduleReconnect();
-    }
+    scheduleReconnect();
   };
 
   wss.onerror = () => {
@@ -126,22 +98,19 @@ function connect(serverUrl, token, deviceId, deviceName) {
 
 // Accept connection from background via chrome.runtime.connect
 chrome.runtime.onConnect.addListener((port) => {
-  console.log('[Offscreen] Port connected:', port.name);
+  console.log('[Offscreen] Port connected', port.name);
   bgPort = port;
 
   port.onMessage.addListener((msg) => {
     if (!msg || msg.target !== 'offscreen') return;
     switch (msg.action) {
       case 'start':
-        savedConfig = [msg.serverUrl, msg.token, msg.deviceId, msg.deviceName];
+        savedConfig = { relayPort: msg.relayPort, token: msg.token, deviceId: msg.deviceId, deviceName: msg.deviceName };
         reconnectAttempts = 0;
-        cancelReconnect();
-        connect(msg.serverUrl, msg.token, msg.deviceId, msg.deviceName);
+        connect(msg.relayPort, msg.token, msg.deviceId, msg.deviceName);
         break;
       case 'stop':
-        savedConfig = null; // prevent auto-reconnect
         reconnectAttempts = 9999;
-        cancelReconnect();
         stopPing();
         ws?.close();
         break;
@@ -156,22 +125,13 @@ chrome.runtime.onConnect.addListener((port) => {
       case 'status':
         port.postMessage({ id: msg._id, connected: ws?.readyState === WebSocket.OPEN });
         break;
-      case 'get_state':
-        // Background can query full state (used after SW restart)
-        port.postMessage({
-          id: msg._id,
-          connected: ws?.readyState === WebSocket.OPEN,
-          hasConfig: !!savedConfig,
-          reconnectAttempts,
-        });
-        break;
     }
   });
 
   port.onDisconnect.addListener(() => {
-    console.log('[Offscreen] Port disconnected (SW killed?)');
+    console.log('[Offscreen] Port disconnected');
     bgPort = null;
-    // WebSocket stays alive — background will reconnect the port when SW restarts
+    // WebSocket stays alive — background will reconnect the port
   });
 });
 

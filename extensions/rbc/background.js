@@ -1,11 +1,14 @@
 // background.js — MV3 Service Worker
 // WebSocket lives in offscreen.html (survives SW termination)
 // Background SW acts as message router to/from offscreen
+//
+// IMPORTANT: Reconnection is handled ONLY by offscreen.js.
+// Background does NOT have its own reconnect loop.
 
 const OFFSCREEN_URL = 'offscreen.html';
+const OFFSCREEN_PORT_NAME = 'rbc-offscreen'; // filter port connections by name
 
 // ============= Offscreen Client =============
-// Manages the offscreen document WebSocket connection via MessagePort
 
 class OffscreenClient {
   constructor() {
@@ -14,19 +17,15 @@ class OffscreenClient {
     this._pending = new Map();
     this._msgId = 0;
 
-    // Listen for new port connections from offscreen
+    // Only accept ports from offscreen (filter by name)
     chrome.runtime.onConnect.addListener((port) => {
-      console.log('[RBC] Port connected from offscreen');
+      if (port.name !== OFFSCREEN_PORT_NAME) return; // ignore content script ports
+      console.log('[RBC] Offscreen port connected');
       this._port = port;
-
-      port.onMessage.addListener((msg) => {
-        this._handlePortMessage(msg);
-      });
-
+      port.onMessage.addListener((msg) => this._handlePortMessage(msg));
       port.onDisconnect.addListener(() => {
-        console.log('[RBC] Port disconnected from offscreen');
+        console.log('[RBC] Offscreen port disconnected');
         this._port = null;
-        // Offscreen died — mark as not ready so next connect recreates it
         this._emit('offscreen_dead', {});
       });
     });
@@ -50,14 +49,12 @@ class OffscreenClient {
         this._emit('message', msg.msg);
         break;
       default: {
-        // Response to a pending request
         const p = this._pending.get(msg.id);
         if (p) { this._pending.delete(msg.id); clearTimeout(p.timeout); p.resolve(msg); }
       }
     }
   }
 
-  // Create or recreate offscreen document
   async _ensureOffscreen() {
     if (!chrome.offscreen) {
       throw new Error('chrome.offscreen API not available (Chrome 116+ required)');
@@ -65,8 +62,6 @@ class OffscreenClient {
 
     const hasDoc = await chrome.offscreen.hasDocument?.() ?? false;
     if (hasDoc) {
-      console.log('[RBC] Offscreen document already exists');
-      // Port may or may not be connected — if port is null, we'll reconnect
       if (this._port) return;
     } else {
       console.log('[RBC] Creating offscreen document...');
@@ -75,15 +70,14 @@ class OffscreenClient {
         reasons: ['WEB_RTC'],
         justification: 'Maintain persistent WebSocket connection to BAP Gateway'
       });
-      // Wait for offscreen to load and connect back
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 500));
     }
 
-    // If port not yet connected, connect now
+    // Establish named port connection to offscreen
     if (!this._port) {
-      console.log('[RBC] Connecting to offscreen...');
+      console.log('[RBC] Connecting port to offscreen...');
       try {
-        this._port = chrome.runtime.connect(chrome.runtime.id, { name: 'offscreen' });
+        this._port = chrome.runtime.connect(chrome.runtime.id, { name: OFFSCREEN_PORT_NAME });
         this._port.onMessage.addListener((msg) => this._handlePortMessage(msg));
         this._port.onDisconnect.addListener(() => {
           this._port = null;
@@ -96,7 +90,6 @@ class OffscreenClient {
     }
   }
 
-  // Send message to offscreen, with response
   _sendPortMsg(msg) {
     return new Promise((resolve) => {
       if (!this._port) { resolve({ ok: false, error: 'No port' }); return; }
@@ -129,9 +122,7 @@ class OffscreenClient {
   }
 
   async disconnect() {
-    try {
-      await this._sendPortMsg({ action: 'stop' });
-    } catch {}
+    try { await this._sendPortMsg({ action: 'stop' }); } catch {}
   }
 
   async send(data) {
@@ -155,16 +146,12 @@ class OffscreenClient {
   }
 }
 
-// ============= RBC Connection Manager (via Offscreen) =============
+// ============= RBC Connection Manager =============
 
 class RBCConnectionManager {
   constructor() {
-    this.ws = null; // unused in offscreen mode
     this.sessionId = null;
     this.connected = false;
-    this.reconnectAttempts = 0;
-    this.reconnectDelay = 1000;
-    this.maxReconnectAttempts = 10;
     this.heartbeatTimer = null;
     this.config = { serverUrl: '', token: '', deviceName: '', deviceId: '', autoConnect: false };
     this.status = 'disconnected';
@@ -172,13 +159,12 @@ class RBCConnectionManager {
     this._commandWaiters = new Map();
     this._offscreen = new OffscreenClient();
 
-    // Route offscreen events to connection manager state
-    this._offscreen.on('connected', ({ sessionId }) => {
+    // Offscreen events → update local state
+    this._offscreen.on('connected', () => {
       this.connected = true;
-      this.sessionId = sessionId;
       this.reconnectAttempts = 0;
-      this._updateStatus('connected', `Connected (${sessionId?.slice(0,8)})`);
-      this._broadcast({ type: 'connected', sessionId });
+      this._updateStatus('connected', 'Connected');
+      this._broadcast({ type: 'connected', sessionId: this.sessionId });
       this._startHeartbeat();
     });
 
@@ -188,24 +174,30 @@ class RBCConnectionManager {
       this._stopHeartbeat();
       this._clearPendingCommands();
       this._updateStatus('disconnected', `Connection closed (${code})`);
-      this._scheduleReconnect();
+      // NO reconnect here — offscreen handles it
     });
 
     this._offscreen.on('reconnecting', ({ delay, attempt }) => {
-      this._updateStatus('reconnecting', `Reconnecting in ${Math.round(delay/1000)}s (attempt ${attempt}/${this.maxReconnectAttempts})`);
+      this._updateStatus('reconnecting', `Reconnecting in ${Math.round(delay/1000)}s (attempt ${attempt})`);
     });
 
     this._offscreen.on('error', ({ message }) => {
       this._updateStatus('error', `Error: ${message}`);
     });
 
-    // Handle WebSocket messages from offscreen
     this._offscreen.on('message', (msg) => {
       this._handleMessage(msg);
     });
 
-    // NOTE: popup/content messages are handled by the global onMessage listener below.
-    // Only gateway commands (from _handleMessage) call _handleCommand.
+    this._offscreen.on('offscreen_dead', () => {
+      this.connected = false;
+      this._stopHeartbeat();
+      this._updateStatus('disconnected', 'Offscreen terminated');
+      // Recreate offscreen if we should be connected
+      if (this.config.autoConnect && this.config.serverUrl && this.config.token) {
+        setTimeout(() => this.connect(), 2000);
+      }
+    });
   }
 
   async loadConfig() {
@@ -218,16 +210,22 @@ class RBCConnectionManager {
 
   async saveConfig(newConfig) {
     Object.assign(this.config, newConfig);
-    await chrome.storage.local.set({ serverUrl: this.config.serverUrl, token: this.config.token, deviceName: this.config.deviceName, deviceId: this.config.deviceId, autoConnect: this.config.autoConnect });
+    await chrome.storage.local.set({
+      serverUrl: this.config.serverUrl, token: this.config.token,
+      deviceName: this.config.deviceName, deviceId: this.config.deviceId,
+      autoConnect: this.config.autoConnect
+    });
   }
 
   getDeviceId() { return this.config.deviceId || chrome.runtime.id; }
 
   async connect() {
-    if (!this.config.serverUrl || !this.config.token) { this._updateStatus('error', 'Server or token not configured'); return; }
-    this._updateStatus('connecting', 'Connecting via offscreen...');
+    if (!this.config.serverUrl || !this.config.token) {
+      this._updateStatus('error', 'Server or token not configured');
+      return;
+    }
+    this._updateStatus('connecting', 'Connecting...');
     try {
-      console.log('[RBC] connect() called, config:', this.config);
       await this._offscreen.connect({
         serverUrl: this.config.serverUrl,
         token: this.config.token,
@@ -238,28 +236,6 @@ class RBCConnectionManager {
       console.error('[RBC] connect() error:', err);
       this._updateStatus('error', 'Offscreen init failed: ' + err.message);
     }
-  }
-
-  _scheduleReconnect() {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this._updateStatus('error', 'Max reconnect attempts reached');
-      return;
-    }
-    const delay = Math.max(5000, Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts), 30000));
-    this.reconnectAttempts++;
-    setTimeout(() => { this.connect(); }, delay);
-  }
-
-  // Authenticate — send via offscreen
-  _authenticate() {
-    this._send({
-      type: 'auth',
-      token: this.config.token,
-      deviceId: this.getDeviceId(),
-      deviceName: this.config.deviceName || `Chrome-${this.getDeviceId().slice(0,8)}`,
-      browserType: 'chrome',
-      tags: ['chrome-extension', 'offscreen']
-    });
   }
 
   _handleMessage(msg) {
@@ -274,15 +250,14 @@ class RBCConnectionManager {
         break;
       case 'pong': break;
       case 'event': this._handleEvent(msg.event, msg.data); break;
-      case 'command': {
-        console.log('[RBC] _handleMessage command:', msg.method, 'id:', msg.id);
-        // All commands (browser.navigate, browser.snapshot, etc.) go through unified _handleCommand
+      case 'command':
         this._handleCommand(msg.id, msg.method, msg.params, (response) => {
           this._send({ type: 'command_response', id: msg.id, ...response });
         });
         break;
-      }
-      case 'command_response': this._handleCommandResponse(msg.id, msg.result, msg.error); break;
+      case 'command_response':
+        this._handleCommandResponse(msg.id, msg.result, msg.error);
+        break;
       default:
         if (msg.type?.startsWith('tab_')) {
           const tabId = msg.type.split('_')[1];
@@ -304,10 +279,9 @@ class RBCConnectionManager {
     this._clearPendingCommands();
     this.sessionId = null;
     this.connected = false;
-    this.reconnectAttempts = 0;
     this._offscreen.disconnect().catch(() => {});
-    this._broadcast({ type: 'status', status: 'disconnected', text: 'Disconnected' });
     this._updateStatus('disconnected', 'Disconnected');
+    this._broadcast({ type: 'status', status: 'disconnected', text: 'Disconnected' });
   }
 
   _clearPendingCommands() {
@@ -330,9 +304,7 @@ class RBCConnectionManager {
     try { pending.sendResponse({ id, result, error }); } catch {}
   }
 
-  _send(data) {
-    return this._offscreen.send(data);
-  }
+  _send(data) { return this._offscreen.send(data); }
 
   _updateStatus(status, text) {
     this.status = status; this.statusText = text;
@@ -340,26 +312,26 @@ class RBCConnectionManager {
   }
 
   _broadcast(message) {
-    chrome.tabs.query({}, (tabs) => { for (const tab of tabs) { if (tab.id) chrome.tabs.sendMessage(tab.id, message).catch(() => {}); } });
+    chrome.tabs.query({}, (tabs) => {
+      for (const tab of tabs) {
+        if (tab.id) chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+      }
+    });
     chrome.runtime.sendMessage(message).catch(() => {});
   }
 
   _startHeartbeat() {
-    this.heartbeatTimer = setInterval(() => { if (this.connected) this._send({ type: 'ping' }); }, 90000);
+    this._stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (this.connected) this._send({ type: 'ping' });
+    }, 25000);
   }
 
   _stopHeartbeat() {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
 
-  _getActiveTab() { return new Promise((resolve) => { chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => resolve(tabs[0]||null)); }); }
-
-  _sendToTab(tabId, method, params) {
-    return chrome.tabs.sendMessage(tabId, { type: method, params });
-  }
-
   _handleCommand(id, method, params, sendResponse) {
-    // Handle browser.navigate locally via Chrome tab API
     if (method === 'browser.navigate') {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs[0]?.id) {
@@ -373,7 +345,6 @@ class RBCConnectionManager {
       return;
     }
 
-    // Handle browser.snapshot locally — forward to content script directly
     if (method === 'browser.snapshot') {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (!tabs[0]?.id) {
@@ -391,7 +362,6 @@ class RBCConnectionManager {
       return;
     }
 
-    // All other commands: forward to content script via gateway round-trip
     let responded = false;
     const timeout = setTimeout(() => {
       if (!responded) {
@@ -403,14 +373,6 @@ class RBCConnectionManager {
     this._commandWaiters.set(id, { method, timeout, sendResponse, responded });
     this._send({ type: 'command', id, method, params });
   }
-
-  _handleLocalCommand(method, params, id) {
-    switch (method) {
-      case 'browser.info': return { id, result: { status: this.status, text: this.statusText } };
-      case 'browser.version': return { id, result: { version: chrome.runtime.getManifest().version } };
-      default: return false;
-    }
-  }
 }
 
 // ============= Global Instance =============
@@ -421,15 +383,17 @@ conn.loadConfig();
 // ============= Message Listeners =============
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  console.log('[RBC] Background received', message.type, message);
-
   switch (message.type) {
     case 'popup_connect':
+      conn.config.autoConnect = true;
+      conn.saveConfig({ autoConnect: true });
       conn.connect();
       sendResponse({ success: true });
       break;
 
     case 'popup_disconnect':
+      conn.config.autoConnect = false;
+      conn.saveConfig({ autoConnect: false });
       conn.disconnect();
       sendResponse({ success: true });
       break;
@@ -454,8 +418,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'content_dialog':
       conn._send({
-        type: 'event',
-        event: 'dialog.opened',
+        type: 'event', event: 'dialog.opened',
         data: { dialogType: message.dialogType, message: message.message }
       });
       sendResponse({ received: true });
@@ -463,8 +426,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'content_page_loaded':
       conn._send({
-        type: 'event',
-        event: 'page.loaded',
+        type: 'event', event: 'page.loaded',
         data: { url: message.url, title: message.title }
       });
       sendResponse({ received: true });
@@ -472,8 +434,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'content_screenshot':
       conn._send({
-        type: 'event',
-        event: 'screenshot.captured',
+        type: 'event', event: 'screenshot.captured',
         data: { screenshot: message.screenshot }
       });
       sendResponse({ received: true });
@@ -495,7 +456,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     default:
       sendResponse({ error: 'Unknown message type' });
   }
-
   return true;
 });
 
@@ -504,8 +464,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete' && tab.url && tab.url.startsWith('http')) {
     conn._send({
-      type: 'event',
-      event: 'page.loaded',
+      type: 'event', event: 'page.loaded',
       data: { url: tab.url, title: tab.title, tabId }
     });
   }
@@ -526,28 +485,19 @@ chrome.webNavigation?.onCompleted?.addListener((details) => {
   }
 });
 
-// ============= Downloads Observer ================================
+// ============= Downloads Observer =============
 
 chrome.downloads.onCreated.addListener((downloadItem) => {
   conn._send({
-    type: 'event',
-    event: 'download.started',
-    data: {
-      id: downloadItem.id,
-      filename: downloadItem.filename,
-      url: downloadItem.url,
-      mimeType: downloadItem.mime,
-      state: downloadItem.state,
-      startedAt: downloadItem.startTime
-    }
+    type: 'event', event: 'download.started',
+    data: { id: downloadItem.id, filename: downloadItem.filename, url: downloadItem.url, mimeType: downloadItem.mime, state: downloadItem.state, startedAt: downloadItem.startTime }
   });
 });
 
 chrome.downloads.onChanged.addListener((delta) => {
   if (delta.state && delta.state.current === 'complete') {
     conn._send({
-      type: 'event',
-      event: 'download.complete',
+      type: 'event', event: 'download.complete',
       data: { id: delta.id, filename: delta.filename?.current, state: delta.state.current }
     });
   }

@@ -1,31 +1,161 @@
 /**
- * RBC Relay — Chrome Extension
- * Connects to local relay (relay.exe), which bridges to remote BAP Gateway.
- * Much simpler than direct connection — relay handles reconnection & keep-alive.
+ * RBC Relay — Chrome Extension (MV3 Service Worker)
+ * WebSocket lives in offscreen.html (survives SW termination).
+ * Background SW routes messages between offscreen ↔ content scripts ↔ popup.
  */
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let relayWs = null;
 let relayToken = null;
 let deviceName = 'RBC-Relay';
 let deviceId = null;
 let relayPort = 18792;
 let autoConnect = false;
-let reconnectTimer = null;
-let reconnectAttempts = 0;
-const RECONNECT_BASE = 3000;
-const RECONNECT_MAX = 30000;
-const MAX_RECONNECT_ATTEMPTS = 15;
+let connected = false;
 
-// ── Load config from storage ──────────────────────────────────────────────────
+// ── OffscreenClient — manages offscreen document + MessagePort ───────────────
+
+const OFFSCREEN_URL = 'offscreen.html';
+const OFFSCREEN_PORT_NAME = 'rbc-relay-offscreen';
+
+class OffscreenClient {
+  constructor() {
+    this._listeners = new Map();
+    this._port = null;
+    this._pending = new Map();
+    this._msgId = 0;
+
+    chrome.runtime.onConnect.addListener((port) => {
+      if (port.name !== OFFSCREEN_PORT_NAME) return;
+      console.log('[RBC-Relay] Offscreen port connected');
+      this._port = port;
+      port.onMessage.addListener((msg) => this._handlePortMessage(msg));
+      port.onDisconnect.addListener(() => {
+        this._port = null;
+        this._emit('offscreen_dead', {});
+      });
+    });
+  }
+
+  _handlePortMessage(msg) {
+    switch (msg.type) {
+      case 'connected':
+        this._emit('connected', {});
+        break;
+      case 'disconnected':
+        this._emit('disconnected', { code: msg.code });
+        break;
+      case 'error':
+        this._emit('error', { message: msg.message });
+        break;
+      case 'reconnecting':
+        this._emit('reconnecting', { delay: msg.delay, attempt: msg.attempt });
+        break;
+      case 'message':
+        this._emit('message', msg.msg);
+        break;
+      default: {
+        const p = this._pending.get(msg.id);
+        if (p) { this._pending.delete(msg.id); clearTimeout(p.timeout); p.resolve(msg); }
+      }
+    }
+  }
+
+  async _ensureOffscreen() {
+    if (!chrome.offscreen) {
+      throw new Error('chrome.offscreen API not available (Chrome 116+ required)');
+    }
+    const hasDoc = await chrome.offscreen.hasDocument?.() ?? false;
+    if (hasDoc) {
+      if (this._port) return;
+    } else {
+      await chrome.offscreen.createDocument({
+        url: OFFSCREEN_URL,
+        reasons: ['WEB_RTC'],
+        justification: 'Maintain persistent WebSocket connection to local relay'
+      });
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!this._port) {
+      try {
+        this._port = chrome.runtime.connect(chrome.runtime.id, { name: OFFSCREEN_PORT_NAME });
+        this._port.onMessage.addListener((msg) => this._handlePortMessage(msg));
+        this._port.onDisconnect.addListener(() => {
+          this._port = null;
+          this._emit('offscreen_dead', {});
+        });
+      } catch (err) {
+        console.error('[RBC-Relay] Failed to connect to offscreen:', err);
+        throw err;
+      }
+    }
+  }
+
+  _sendPortMsg(msg) {
+    return new Promise((resolve) => {
+      if (!this._port) { resolve({ ok: false, error: 'No port' }); return; }
+      const id = ++this._msgId;
+      msg._id = id;
+      const timeout = setTimeout(() => {
+        this._pending.delete(id);
+        resolve({ ok: false, error: 'Timeout' });
+      }, 10000);
+      this._pending.set(id, { resolve, timeout });
+      try {
+        this._port.postMessage({ target: 'offscreen', ...msg });
+      } catch (err) {
+        clearTimeout(timeout);
+        this._pending.delete(id);
+        resolve({ ok: false, error: err.message });
+      }
+    });
+  }
+
+  async connect(config) {
+    await this._ensureOffscreen();
+    await this._sendPortMsg({
+      action: 'start',
+      relayPort: config.relayPort,
+      token: config.token,
+      deviceId: config.deviceId,
+      deviceName: config.deviceName
+    });
+  }
+
+  async disconnect() {
+    try { await this._sendPortMsg({ action: 'stop' }); } catch {}
+  }
+
+  async send(data) {
+    const resp = await this._sendPortMsg({ action: 'send', data });
+    return resp?.ok ?? false;
+  }
+
+  async status() {
+    const resp = await this._sendPortMsg({ action: 'status' });
+    return resp?.connected ?? false;
+  }
+
+  on(event, cb) {
+    if (!this._listeners.has(event)) this._listeners.set(event, []);
+    this._listeners.get(event).push(cb);
+  }
+
+  _emit(event, data) {
+    const cbs = this._listeners.get(event) || [];
+    for (const cb of cbs) try { cb(data); } catch {}
+  }
+}
+
+const offscreen = new OffscreenClient();
+
+// ── Load/Save config ──────────────────────────────────────────────────────────
+
 async function loadConfig() {
   const result = await chrome.storage.local.get(['relayPort', 'relayToken', 'deviceName', 'autoConnect', 'deviceId']);
   relayPort = result.relayPort || 18792;
   relayToken = result.relayToken || '';
   deviceName = result.deviceName || 'RBC-Relay';
   autoConnect = result.autoConnect ?? false;
-
-  // Persistent deviceId — generate once, reuse forever
   if (result.deviceId) {
     deviceId = result.deviceId;
   } else {
@@ -48,6 +178,7 @@ async function saveConfig(cfg) {
 }
 
 // ── Status broadcast ──────────────────────────────────────────────────────────
+
 function broadcastStatus(status, text) {
   const msg = { type: 'status', status, text };
   chrome.runtime.sendMessage(msg).catch(() => {});
@@ -56,13 +187,30 @@ function broadcastStatus(status, text) {
   });
 }
 
-// ── Command routing: forward gateway commands to content script ───────────────
-function handleGatewayMessage(msg) {
+// ── Send to relay via offscreen ───────────────────────────────────────────────
+
+function sendToRelay(data) {
+  offscreen.send(data);
+}
+
+// ── Command routing: relay commands → content script ──────────────────────────
+
+function handleRelayMessage(msg) {
+  if (msg.type === 'relay_ready') return true; // relay handshake, ignore
+  if (msg.type === 'auth_ok') {
+    broadcastStatus('connected', `已连接 relay:${relayPort}`);
+    return true;
+  }
+  if (msg.type === 'auth_error') {
+    broadcastStatus('error', `认证失败: ${msg.error}`);
+    return true;
+  }
+  if (msg.type === 'pong') return true;
   if (msg.type !== 'command') return false;
 
   const { id, method, params } = msg;
 
-  // browser.navigate — handle locally via Chrome tab API
+  // browser.navigate — handle locally
   if (method === 'browser.navigate') {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (tabs[0]?.id) {
@@ -76,27 +224,7 @@ function handleGatewayMessage(msg) {
     return true;
   }
 
-  // browser.snapshot — forward to content script
-  if (method === 'browser.snapshot') {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (!tabs[0]?.id) {
-        sendToRelay({ type: 'command_response', id, error: { code: -32000, message: 'No active tab' } });
-        return;
-      }
-      chrome.tabs.sendMessage(tabs[0].id, { type: 'execute', command: method, params: params || {} }, (resp) => {
-        if (chrome.runtime.lastError) {
-          sendToRelay({ type: 'command_response', id, error: { code: -32000, message: chrome.runtime.lastError.message } });
-        } else if (resp?.error) {
-          sendToRelay({ type: 'command_response', id, error: resp.error });
-        } else {
-          sendToRelay({ type: 'command_response', id, result: resp });
-        }
-      });
-    });
-    return true;
-  }
-
-  // All other commands — forward to active tab's content script
+  // All other commands — forward to content script
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (!tabs[0]?.id) {
       sendToRelay({ type: 'command_response', id, error: { code: -32000, message: 'No active tab' } });
@@ -115,112 +243,82 @@ function handleGatewayMessage(msg) {
   return true;
 }
 
-function sendToRelay(data) {
-  if (relayWs && relayWs.readyState === WebSocket.OPEN) {
-    relayWs.send(JSON.stringify(data));
-  }
-}
+// ── Offscreen events ──────────────────────────────────────────────────────────
 
-// ── Connect to local relay ────────────────────────────────────────────────────
-function connect() {
+offscreen.on('connected', () => {
+  connected = true;
+  broadcastStatus('connected', `Relay ${relayPort} 已连接`);
+});
+
+offscreen.on('disconnected', ({ code }) => {
+  connected = false;
+  broadcastStatus('disconnected', `Relay 已断开 (${code})`);
+});
+
+offscreen.on('reconnecting', ({ delay, attempt }) => {
+  broadcastStatus('reconnecting', `重连中 ${Math.round(delay / 1000)}s (${attempt})`);
+});
+
+offscreen.on('error', ({ message }) => {
+  broadcastStatus('error', message);
+});
+
+offscreen.on('message', (msg) => {
+  if (handleRelayMessage(msg)) return;
+  // Broadcast other messages to popup/tabs
+  chrome.tabs.query({}, (tabs) => {
+    tabs.forEach(tab => { if (tab.id) chrome.tabs.sendMessage(tab.id, msg).catch(() => {}); });
+  });
+  chrome.runtime.sendMessage(msg).catch(() => {});
+});
+
+offscreen.on('offscreen_dead', () => {
+  connected = false;
+  broadcastStatus('disconnected', 'Offscreen 进程终止');
+  // Auto-recreate if was connected
+  if (autoConnect && relayToken) {
+    setTimeout(() => doConnect(), 2000);
+  }
+});
+
+// ── Connect / Disconnect ──────────────────────────────────────────────────────
+
+async function doConnect() {
   if (!relayToken) {
     broadcastStatus('error', '请先填写 Relay Token');
     return;
   }
-  if (relayWs && relayWs.readyState === WebSocket.OPEN) return;
-
   broadcastStatus('connecting', `连接 localhost:${relayPort}...`);
-
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-
   try {
-    // Connect without token in URL — authenticate via message after connect
-    relayWs = new WebSocket(`ws://127.0.0.1:${relayPort}`);
+    await offscreen.connect({ relayPort, token: relayToken, deviceId, deviceName });
   } catch (err) {
     broadcastStatus('error', `连接失败: ${err.message}`);
-    scheduleReconnect();
-    return;
   }
-
-  relayWs.onopen = () => {
-    reconnectAttempts = 0;
-    broadcastStatus('connected', `Relay ${relayPort} 已连接`);
-    // Authenticate so relay knows our identity
-    relayWs.send(JSON.stringify({
-      type: 'auth',
-      token: relayToken,
-      deviceId,
-      deviceName,
-      browserType: 'chrome',
-      tags: ['rbc-relay']
-    }));
-  };
-
-  relayWs.onmessage = (event) => {
-    try {
-      const msg = JSON.parse(event.data);
-      // Try to handle as gateway command first
-      if (handleGatewayMessage(msg)) return;
-      // Otherwise broadcast to tabs and popup (status updates, events, etc.)
-      chrome.tabs.query({}, (tabs) => {
-        tabs.forEach(tab => { if (tab.id) chrome.tabs.sendMessage(tab.id, msg).catch(() => {}); });
-      });
-      chrome.runtime.sendMessage(msg).catch(() => {});
-    } catch (err) {
-      console.warn('[RBC-Relay] Failed to parse message:', err.message);
-    }
-  };
-
-  relayWs.onclose = (event) => {
-    relayWs = null;
-    broadcastStatus('disconnected', `Relay 已断开 (${event.code})`);
-    scheduleReconnect();
-  };
-
-  relayWs.onerror = () => {
-    relayWs?.close();
-  };
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  if (!autoConnect) return;
-  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    broadcastStatus('error', `已达最大重连次数 (${MAX_RECONNECT_ATTEMPTS})`);
-    return;
-  }
-  const delay = Math.min(RECONNECT_BASE * Math.pow(2, reconnectAttempts), RECONNECT_MAX);
-  reconnectAttempts++;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connect();
-  }, delay);
-}
-
-function disconnect() {
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  reconnectAttempts = 0;
-  if (relayWs) { relayWs.close(1000, 'User disconnect'); relayWs = null; }
+function doDisconnect() {
+  autoConnect = false;
+  connected = false;
+  offscreen.disconnect();
   broadcastStatus('disconnected', '已断开');
 }
 
 // ── Listen for messages from popup / content scripts ──────────────────────────
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.type) {
     case 'connect':
       relayToken = msg.token || relayToken;
       deviceName = msg.deviceName || deviceName;
       autoConnect = true;
-      reconnectAttempts = 0;
-      saveConfig({ relayToken: msg.token, deviceName: msg.deviceName, autoConnect: true }).then(connect);
+      saveConfig({ relayToken: msg.token, deviceName: msg.deviceName, autoConnect: true }).then(doConnect);
       break;
     case 'disconnect':
-      autoConnect = false;
-      disconnect();
+      doDisconnect();
       break;
     case 'getStatus':
       sendResponse({
-        status: relayWs?.readyState === WebSocket.OPEN ? 'connected' : 'disconnected',
+        status: connected ? 'connected' : 'disconnected',
         relayPort,
         deviceName,
         deviceId
@@ -233,6 +331,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 // ── Tab Observers — notify gateway of page loads ─────────────────────────────
+
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete' && tab.url && tab.url.startsWith('http')) {
     sendToRelay({
@@ -244,10 +343,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+
 loadConfig().then(() => {
-  if (autoConnect) connect();
+  if (autoConnect) doConnect();
 });
 
 chrome.runtime.onInstalled.addListener(() => {
   loadConfig();
 });
+
+console.log('[RBC-Relay] Background service worker initialized (offscreen mode)');

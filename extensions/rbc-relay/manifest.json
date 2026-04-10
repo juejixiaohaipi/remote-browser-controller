@@ -8,7 +8,8 @@
     "tabs",
     "webNavigation",
     "downloads",
-    "storage"
+    "storage",
+    "offscreen"
   ],
   "host_permissions": [
     "<all_urls>"

@@ -40,6 +40,7 @@ const args = process.argv.slice(2).reduce((acc, arg, i, arr) => {
 }, {});
 
 const LISTEN_PORT  = parseInt(args.port || process.env.RBC_RELAY_PORT || process.env.RELAY_PORT || '18792');
+const LISTEN_HOST  = args.host || process.env.RBC_RELAY_HOST || '127.0.0.1';
 const GATEWAY_URL  = args.gateway || process.env.RBC_GATEWAY_URL || '';
 const DEVICE_ID    = args['device-id'] || process.env.RBC_DEVICE_ID || 'rbc-relay';
 const DEVICE_NAME  = args['device-name'] || process.env.RBC_DEVICE_NAME || 'RBC-Relay';
@@ -217,6 +218,25 @@ const httpServer = http.createServer((req, res) => {
   }
 });
 
+// ── Extension heartbeat — detect dead connections early ──────────────────────
+const EXT_PING_INTERVAL = 25000;
+let extPingTimer = null;
+
+function startExtPing(ws) {
+  stopExtPing();
+  extPingTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping(); // WebSocket-level ping, auto-replied with pong by client
+    } else {
+      stopExtPing();
+    }
+  }, EXT_PING_INTERVAL);
+}
+
+function stopExtPing() {
+  if (extPingTimer) { clearInterval(extPingTimer); extPingTimer = null; }
+}
+
 // ── WebSocket server (receives connections from Chrome extension) ────────────
 const wss = new WebSocket.Server({ server: httpServer });
 
@@ -302,6 +322,7 @@ wss.on('connection', (ws, req) => {
     if (extensionConnection === ws) {
       extensionConnection = null;
       extensionAuth = null;
+      stopExtPing();
     }
   });
 
@@ -310,13 +331,16 @@ wss.on('connection', (ws, req) => {
     if (extensionConnection === ws) extensionConnection = null;
   });
 
+  // Start server-side ping to detect dead connections
+  startExtPing(ws);
+
   // Send ready signal to extension
   ws.send(JSON.stringify({ type: 'relay_ready', relayVersion: '1.1.0' }));
 });
 
 // ── Start ───────────────────────────────────────────────────────────────────
-httpServer.listen(LISTEN_PORT, '127.0.0.1', () => {
-  log(`RBC Relay listening on http://127.0.0.1:${LISTEN_PORT}`);
+httpServer.listen(LISTEN_PORT, LISTEN_HOST, () => {
+  log(`RBC Relay listening on http://${LISTEN_HOST}:${LISTEN_PORT}`);
   log(`Gateway target: ${GATEWAY_URL}`);
   log(`Device: ${DEVICE_NAME} (${DEVICE_ID})`);
   connectToGateway();
