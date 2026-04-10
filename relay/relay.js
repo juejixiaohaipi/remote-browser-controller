@@ -68,6 +68,7 @@ const messageQueue = [];
 
 let relayConnection = null; // WebSocket to remote BAP Gateway
 let extensionConnection = null; // WebSocket from Chrome extension
+let extensionAuth = null; // Auth info from extension's auth message
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 function log(...args) {
@@ -75,6 +76,26 @@ function log(...args) {
 }
 function logError(...args) {
   console.error(LOG_PREFIX, new Date().toISOString(), 'ERROR:', ...args);
+}
+
+// ── Determine effective device identity for gateway auth ─────────────────────
+function getGatewayAuth() {
+  // Prefer extension's deviceId/deviceName if available
+  if (extensionAuth && extensionAuth.deviceId) {
+    return {
+      deviceId: extensionAuth.deviceId,
+      deviceName: extensionAuth.deviceName || extensionAuth.deviceId,
+      browserType: 'chrome',
+      tags: ['chrome-extension', 'via-relay']
+    };
+  }
+  // Fall back to relay's own identity
+  return {
+    deviceId: DEVICE_ID,
+    deviceName: DEVICE_NAME,
+    browserType: 'relay',
+    tags: ['rbc-relay', 'cdp-bridge']
+  };
 }
 
 // ── Connect to remote BAP Gateway ───────────────────────────────────────────
@@ -93,14 +114,12 @@ function connectToGateway() {
   relayConnection.on('open', () => {
     reconnectAttempts = 0;
     log('Connected to BAP Gateway, authenticating...');
-    // Authenticate as a browser/relay device
+    const auth = getGatewayAuth();
+    log(`Gateway auth as deviceId=${auth.deviceId} deviceName=${auth.deviceName}`);
     relayConnection.send(JSON.stringify({
       type: 'auth',
       token: TOKEN,
-      deviceId: DEVICE_ID,
-      deviceName: DEVICE_NAME,
-      browserType: 'relay',
-      tags: ['rbc-relay', 'cdp-bridge']
+      ...auth
     }));
     // Flush queued messages
     flushMessageQueue();
@@ -127,6 +146,7 @@ function connectToGateway() {
 
   relayConnection.on('error', (err) => {
     logError('Gateway connection error:', err.message);
+    relayConnection?.close();
   });
 }
 
@@ -160,18 +180,33 @@ function sendToGateway(data) {
     if (messageQueue.length > MSG_QUEUE_MAX) {
       messageQueue.shift(); // Drop oldest
     }
-    log(`Gateway not connected, queued message (${messageQueue.length}/${MSG_QUEUE_MAX})`);
+    if (relayConnection) {
+      log(`Gateway not connected, queued message (${messageQueue.length}/${MSG_QUEUE_MAX})`);
+    }
   }
 }
 
-// ── Local HTTP server (health check) ───────────────────────────────────────
+// Re-authenticate to gateway with new extension auth info
+function reauthToGateway() {
+  if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) return;
+  const auth = getGatewayAuth();
+  log(`Re-auth gateway as deviceId=${auth.deviceId} deviceName=${auth.deviceName}`);
+  relayConnection.send(JSON.stringify({
+    type: 'auth',
+    token: TOKEN,
+    ...auth
+  }));
+}
+
+// ── HTTP health check ────────────────────────────────────────────────────────
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status: 'ok',
+      ok: true,
+      relayVersion: '1.1.0',
+      extensionConnected: extensionConnection !== null && extensionConnection.readyState === WebSocket.OPEN,
       gateway: relayConnection?.readyState === WebSocket.OPEN ? 'connected' : 'disconnected',
-      extension: extensionConnection?.readyState === WebSocket.OPEN ? 'connected' : 'disconnected',
       queuedMessages: messageQueue.length,
       uptime: process.uptime()
     }));
@@ -224,7 +259,15 @@ wss.on('connection', (ws, req) => {
             return;
           }
           authenticated = true;
-          log('Extension authenticated via auth message');
+          // Store extension's auth info for gateway authentication
+          extensionAuth = {
+            deviceId: msg.deviceId,
+            deviceName: msg.deviceName,
+            browserType: msg.browserType
+          };
+          log(`Extension authenticated: deviceId=${extensionAuth.deviceId} deviceName=${extensionAuth.deviceName}`);
+          // Re-auth to gateway with extension's identity
+          reauthToGateway();
         } else {
           log('Extension not authenticated, rejecting message');
           ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
@@ -242,7 +285,12 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', (code, reason) => {
     log(`Extension disconnected: code=${code} reason=${reason || 'none'}`);
-    if (extensionConnection === ws) extensionConnection = null;
+    if (extensionConnection === ws) {
+      extensionConnection = null;
+      // Clear extension auth so next extension uses relay's own identity
+      // (or we keep it if we want persistent identity across reconnects)
+      // extensionAuth = null;
+    }
   });
 
   ws.on('error', (err) => {
@@ -262,11 +310,17 @@ httpServer.listen(LISTEN_PORT, '0.0.0.0', () => {
   connectToGateway();
 });
 
-process.on('SIGINT', () => {
-  log('Shutting down...');
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  if (relayConnection) relayConnection.close();
-  if (extensionConnection) extensionConnection.close();
+// ── Graceful shutdown ────────────────────────────────────────────────────────
+process.on('SIGTERM', () => {
+  log('Received SIGTERM, shutting down...');
   httpServer.close();
+  relayConnection?.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  log('Received SIGINT, shutting down...');
+  httpServer.close();
+  relayConnection?.close();
   process.exit(0);
 });
