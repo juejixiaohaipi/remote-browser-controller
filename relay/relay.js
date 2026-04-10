@@ -163,12 +163,13 @@ function scheduleGatewayReconnect() {
 
 function flushMessageQueue() {
   if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) return;
+  const count = messageQueue.length;
+  if (count === 0) return;
   while (messageQueue.length > 0) {
     const msg = messageQueue.shift();
     relayConnection.send(msg);
   }
-  if (messageQueue.length === 0) return;
-  log(`Flushed ${messageQueue.length} queued messages`);
+  log(`Flushed ${count} queued messages`);
 }
 
 function sendToGateway(data) {
@@ -266,13 +267,26 @@ wss.on('connection', (ws, req) => {
             browserType: msg.browserType
           };
           log(`Extension authenticated: deviceId=${extensionAuth.deviceId} deviceName=${extensionAuth.deviceName}`);
-          // Re-auth to gateway with extension's identity
+          // Re-auth to gateway with extension's identity (don't forward original auth)
           reauthToGateway();
+          return;
         } else {
           log('Extension not authenticated, rejecting message');
           ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
           return;
         }
+      }
+
+      // Don't forward auth messages — relay handles gateway auth itself
+      if (msg.type === 'auth') {
+        log('Extension re-auth, updating identity');
+        extensionAuth = {
+          deviceId: msg.deviceId,
+          deviceName: msg.deviceName,
+          browserType: msg.browserType
+        };
+        reauthToGateway();
+        return;
       }
 
       log('← from extension:', msg.type);
@@ -287,9 +301,7 @@ wss.on('connection', (ws, req) => {
     log(`Extension disconnected: code=${code} reason=${reason || 'none'}`);
     if (extensionConnection === ws) {
       extensionConnection = null;
-      // Clear extension auth so next extension uses relay's own identity
-      // (or we keep it if we want persistent identity across reconnects)
-      // extensionAuth = null;
+      extensionAuth = null;
     }
   });
 
@@ -303,8 +315,8 @@ wss.on('connection', (ws, req) => {
 });
 
 // ── Start ───────────────────────────────────────────────────────────────────
-httpServer.listen(LISTEN_PORT, '0.0.0.0', () => {
-  log(`RBC Relay listening on http://0.0.0.0:${LISTEN_PORT}`);
+httpServer.listen(LISTEN_PORT, '127.0.0.1', () => {
+  log(`RBC Relay listening on http://127.0.0.1:${LISTEN_PORT}`);
   log(`Gateway target: ${GATEWAY_URL}`);
   log(`Device: ${DEVICE_NAME} (${DEVICE_ID})`);
   connectToGateway();
