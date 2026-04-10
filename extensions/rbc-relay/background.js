@@ -97,8 +97,8 @@ class OffscreenClient {
       msg._id = id;
       const timeout = setTimeout(() => {
         this._pending.delete(id);
-        resolve({ ok: false, error: 'Timeout' });
-      }, 10000);
+        resolve({ ok: false, error: 'Timeout waiting for offscreen response' });
+      }, 5000); // Reduced from 10s for faster failure
       this._pending.set(id, { resolve, timeout });
       try {
         this._port.postMessage({ target: 'offscreen', ...msg });

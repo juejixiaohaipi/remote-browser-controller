@@ -97,8 +97,8 @@ class OffscreenClient {
       msg._id = id;
       const timeout = setTimeout(() => {
         this._pending.delete(id);
-        resolve({ ok: false, error: 'Timeout' });
-      }, 10000);
+        resolve({ ok: false, error: 'Timeout waiting for offscreen response' });
+      }, 5000); // Reduced from 10s for faster failure
       this._pending.set(id, { resolve, timeout });
       try {
         this._port.postMessage({ target: 'offscreen', ...msg });
@@ -378,7 +378,35 @@ class RBCConnectionManager {
 // ============= Global Instance =============
 
 const conn = new RBCConnectionManager();
-conn.loadConfig();
+
+// Restore state after Service Worker restart
+async function restoreState() {
+  await conn.loadConfig();
+  
+  // If autoConnect is enabled, check if we should reconnect
+  if (conn.config.autoConnect && conn.config.serverUrl && conn.config.token) {
+    console.log('[RBC] SW restarted, restoring connection...');
+    // Give offscreen time to initialize, then check its state
+    setTimeout(async () => {
+      try {
+        const isConnected = await conn._offscreen.status();
+        if (!isConnected) {
+          console.log('[RBC] Offscreen not connected, reconnecting...');
+          await conn.connect();
+        } else {
+          console.log('[RBC] Offscreen already connected, syncing state');
+          conn.connected = true;
+          conn._updateStatus('connected', 'Connected (restored)');
+        }
+      } catch (err) {
+        console.error('[RBC] Failed to restore state:', err);
+        await conn.connect();
+      }
+    }, 500);
+  }
+}
+
+restoreState();
 
 // ============= Message Listeners =============
 

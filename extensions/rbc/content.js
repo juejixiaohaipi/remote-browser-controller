@@ -8,13 +8,24 @@
 
   // ── Keep SW alive via persistent port (MV3) ──
   let rbcPort = null;
+  let reconnectCount = 0;
+  const MAX_RECONNECT = 10; // Max reconnection attempts to prevent infinite loops
+
   function connectToBackground() {
+    if (reconnectCount >= MAX_RECONNECT) {
+      console.error('[RBC] Max reconnection attempts reached, giving up');
+      return;
+    }
     try {
+      reconnectCount = 0; // Reset on successful connection
       rbcPort = chrome.runtime.connect({ name: 'rbc-tab' });
       rbcPort.onDisconnect.addListener(() => {
         rbcPort = null;
-        // Reconnect after short delay
-        setTimeout(connectToBackground, 3000);
+        reconnectCount++;
+        // Reconnect after short delay with exponential backoff
+        const delay = Math.min(1000 * Math.pow(2, reconnectCount), 10000);
+        console.log(`[RBC] Port disconnected, reconnecting in ${delay}ms (attempt ${reconnectCount}/${MAX_RECONNECT})`);
+        setTimeout(connectToBackground, delay);
       });
       rbcPort.onMessage.addListener((msg) => {
         // 'ping' from background — respond to keep connection alive
@@ -22,8 +33,12 @@
           try { rbcPort.postMessage({ type: 'pong' }); } catch {}
         }
       });
-    } catch {
-      setTimeout(connectToBackground, 5000);
+    } catch (err) {
+      reconnectCount++;
+      console.error(`[RBC] Failed to connect port (attempt ${reconnectCount}/${MAX_RECONNECT}):`, err);
+      if (reconnectCount < MAX_RECONNECT) {
+        setTimeout(connectToBackground, 5000);
+      }
     }
   }
   connectToBackground();

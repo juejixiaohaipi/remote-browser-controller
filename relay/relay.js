@@ -68,7 +68,11 @@ let gwPongReceived = true;
 
 // ── Message queue for when gateway is disconnected ───────────────────────────
 const MSG_QUEUE_MAX = 100;
-const messageQueue = [];
+const MSG_TTL_MS = 30000; // Messages older than 30 seconds will be discarded
+const messageQueue = []; // Array of { data, priority, timestamp }
+
+// Priority constants
+const PRIORITY = { HIGH: 0, NORMAL: 1, LOW: 2 };
 
 let relayConnection = null; // WebSocket to remote BAP Gateway
 let extensionConnection = null; // WebSocket from Chrome extension
@@ -125,6 +129,8 @@ function connectToGateway() {
       token: TOKEN,
       ...auth
     }));
+    // Flush any queued messages that accumulated while disconnected
+    flushMessageQueue();
     // Notify extension that gateway is back
     notifyExtension({ type: 'event', event: 'relay.gateway_connected', data: {} });
     // Start heartbeat to detect dead gateway connections
@@ -150,12 +156,12 @@ function connectToGateway() {
     log(`Gateway connection closed: code=${code} reason=${reason || 'none'}`);
     stopGwPing();
     relayConnection = null;
-    // Notify extension that gateway is down
+    // Notify extension that gateway is down (HIGH priority)
     notifyExtension({ type: 'event', event: 'relay.gateway_disconnected', data: { code } });
-    // Clear stale queued messages — they'll timeout on extension side anyway
+    // Clean up expired messages but keep valid ones for reconnection
+    cleanupStaleMessages();
     if (messageQueue.length > 0) {
-      log(`Discarding ${messageQueue.length} stale queued messages`);
-      messageQueue.length = 0;
+      log(`Keeping ${messageQueue.length} valid messages in queue for reconnection`);
     }
     scheduleGatewayReconnect();
   });
@@ -197,26 +203,84 @@ function scheduleGatewayReconnect() {
   }, delay);
 }
 
+// ── Message queue utilities ───────────────────────────────────────────────────
+
+/** Remove messages older than MSG_TTL_MS */
+function cleanupStaleMessages() {
+  const now = Date.now();
+  let removed = 0;
+  while (messageQueue.length > 0 && now - messageQueue[0].timestamp > MSG_TTL_MS) {
+    messageQueue.shift();
+    removed++;
+  }
+  if (removed > 0) {
+    log(`Cleaned up ${removed} expired messages from queue`);
+  }
+}
+
+/** Enqueue a message with priority and TTL */
+function enqueueMessage(data, priority = PRIORITY.NORMAL) {
+  // First, clean up expired messages
+  cleanupStaleMessages();
+
+  const item = { data, priority, timestamp: Date.now() };
+
+  // If queue is full, try to drop a lower priority message
+  if (messageQueue.length >= MSG_QUEUE_MAX) {
+    // Find the lowest priority message (highest priority number)
+    let lowestPriorityIdx = -1;
+    let lowestPriority = -1;
+    for (let i = 0; i < messageQueue.length; i++) {
+      if (messageQueue[i].priority > lowestPriority) {
+        lowestPriority = messageQueue[i].priority;
+        lowestPriorityIdx = i;
+      }
+    }
+    // Only drop if the new message has higher priority
+    if (lowestPriorityIdx >= 0 && priority < lowestPriority) {
+      messageQueue.splice(lowestPriorityIdx, 1);
+      log(`Dropped low priority message to make room for high priority message`);
+    } else if (priority === PRIORITY.LOW) {
+      // Drop this low priority message
+      log(`Queue full, dropping low priority message`);
+      return;
+    } else {
+      // Queue full but can't drop anything, drop oldest
+      messageQueue.shift();
+    }
+  }
+
+  messageQueue.push(item);
+}
+
+/** Flush queued messages to gateway, sorted by priority */
 function flushMessageQueue() {
   if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) return;
+  
+  // Clean up expired messages first
+  cleanupStaleMessages();
+  
+  // Sort by priority (lower number = higher priority), then by timestamp
+  messageQueue.sort((a, b) => {
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return a.timestamp - b.timestamp;
+  });
+
   const count = messageQueue.length;
   if (count === 0) return;
+
   while (messageQueue.length > 0) {
-    const msg = messageQueue.shift();
-    relayConnection.send(msg);
+    const item = messageQueue.shift();
+    relayConnection.send(item.data);
   }
   log(`Flushed ${count} queued messages`);
 }
 
-function sendToGateway(data) {
+function sendToGateway(data, priority = PRIORITY.NORMAL) {
   if (relayConnection && relayConnection.readyState === WebSocket.OPEN) {
     relayConnection.send(data);
   } else {
-    // Queue message for when gateway reconnects
-    messageQueue.push(data);
-    if (messageQueue.length > MSG_QUEUE_MAX) {
-      messageQueue.shift(); // Drop oldest
-    }
+    enqueueMessage(data, priority);
     if (relayConnection) {
       log(`Gateway not connected, queued message (${messageQueue.length}/${MSG_QUEUE_MAX})`);
     }
@@ -261,8 +325,8 @@ const httpServer = http.createServer((req, res) => {
 });
 
 // ── Extension heartbeat — detect dead connections via pong timeout ───────────
-const EXT_PING_INTERVAL = 25000;
-const EXT_PONG_TIMEOUT = 10000; // if no pong within 10s, consider dead
+const EXT_PING_INTERVAL = 15000;  // Reduced from 25s for faster dead connection detection
+const EXT_PONG_TIMEOUT = 8000;    // Reduced from 10s
 let extPingTimer = null;
 let extPongReceived = true;
 
@@ -296,16 +360,7 @@ function stopExtPing() {
 const wss = new WebSocket.Server({ server: httpServer });
 
 wss.on('connection', (ws, req) => {
-  const query = url.parse(req.url, true).query;
   const clientIp = req.socket.remoteAddress;
-
-  // Validate token — accept from query param or wait for auth message
-  const queryToken = query.token;
-  if (queryToken && queryToken !== TOKEN) {
-    log(`Rejected extension from ${clientIp}: invalid token`);
-    ws.close(1008, 'Invalid token');
-    return;
-  }
 
   // Allow new connection to replace stale old connection
   if (extensionConnection && extensionConnection.readyState === WebSocket.OPEN) {
@@ -315,7 +370,7 @@ wss.on('connection', (ws, req) => {
 
   log(`Extension connected from ${clientIp}`);
   extensionConnection = ws;
-  let authenticated = !!queryToken; // Pre-authenticated if token in query
+  let authenticated = false; // Must authenticate via auth message (not URL param for security)
 
   // Ensure gateway connection is alive
   if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) {
