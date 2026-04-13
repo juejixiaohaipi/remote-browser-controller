@@ -11,31 +11,44 @@
   let reconnectCount = 0;
   const MAX_RECONNECT = 10; // Max reconnection attempts to prevent infinite loops
 
+  // Detect orphaned content script: extension was reloaded/uninstalled,
+  // chrome.runtime becomes undefined and recovery requires a page reload.
+  function isContextValid() {
+    try { return !!(chrome && chrome.runtime && chrome.runtime.id); }
+    catch { return false; }
+  }
+
   function connectToBackground() {
     if (reconnectCount >= MAX_RECONNECT) {
       console.error('[RBC] Max reconnection attempts reached, giving up');
       return;
     }
+    // Guard: chrome.runtime undefined → orphaned content script. Retrying is futile.
+    if (!isContextValid()) {
+      console.warn('[RBC] Extension context invalidated — content script orphaned. Reload the page.');
+      return;
+    }
+
     try {
-      chrome.runtime.lastError = null;
       rbcPort = chrome.runtime.connect({ name: 'rbc-tab' });
-      // Check lastError — MV3 SW restart causes "Extension context invalidated" here
-      const lastErr = chrome.runtime.lastError?.message;
+      const lastErr = chrome.runtime && chrome.runtime.lastError && chrome.runtime.lastError.message;
       if (lastErr) {
         console.error(`[RBC] connect lastError: ${lastErr}`);
-        reconnectCount++;
-        if (lastErr.includes('Extension context') || reconnectCount >= MAX_RECONNECT) {
-          console.error(`[RBC] Extension context invalid — not retrying (SW may be dead). Try reloading the extension.`);
-          return;
+        if (lastErr.includes('Extension context') || lastErr.includes('Receiving end')) {
+          return; // orphan — don't retry
         }
+        reconnectCount++;
         setTimeout(connectToBackground, Math.min(5000 * Math.pow(2, reconnectCount), 30000));
         return;
       }
-      reconnectCount = 0;
+
       rbcPort.onDisconnect.addListener(() => {
         rbcPort = null;
+        if (!isContextValid()) {
+          console.warn('[RBC] Extension context lost on disconnect — giving up.');
+          return;
+        }
         reconnectCount++;
-        // Reconnect after short delay with exponential backoff
         const delay = Math.min(1000 * Math.pow(2, reconnectCount), 10000);
         console.log(`[RBC] Port disconnected, reconnecting in ${delay}ms (attempt ${reconnectCount}/${MAX_RECONNECT})`);
         setTimeout(connectToBackground, delay);
@@ -47,8 +60,20 @@
         }
       });
     } catch (err) {
+      const rawMsg = (err && err.message) || String(err);
+      // Common orphan signatures:
+      //   TypeError: Cannot read properties of undefined (reading 'connect')
+      //   Error: Extension context invalidated
+      if (!isContextValid()
+          || rawMsg.includes('Extension context')
+          || rawMsg.includes('context invalidated')
+          || rawMsg.includes("reading 'connect'")
+          || rawMsg.includes("reading 'sendMessage'")) {
+        console.warn('[RBC] Extension context invalidated — stopping retries. Reload the page.');
+        return;
+      }
       reconnectCount++;
-      console.error(`[RBC] Failed to connect port (attempt ${reconnectCount}/${MAX_RECONNECT}):`, err.message);
+      console.error(`[RBC] Failed to connect port (attempt ${reconnectCount}/${MAX_RECONNECT}):`, rawMsg);
       if (reconnectCount < MAX_RECONNECT) {
         setTimeout(connectToBackground, 5000);
       }
@@ -64,11 +89,14 @@
   function notifyDialog(dialogType, message) {
     console.log('[RBC] Dialog intercepted:', dialogType, message);
     lastDialog = { dialogType, message: String(message), timestamp: Date.now() };
-    chrome.runtime.sendMessage({
-      type: 'content_dialog',
-      dialogType,
-      message: String(message)
-    });
+    if (!isContextValid()) return;
+    try {
+      chrome.runtime.sendMessage({
+        type: 'content_dialog',
+        dialogType,
+        message: String(message)
+      });
+    } catch {}
   }
 
   window.alert = function(message) {
@@ -432,10 +460,14 @@
     'page.screenshot': async ({ fullPage }) => {
       // Helper: capture current viewport via background
       const captureViewport = () => new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({ type: 'capture_visible_tab' }, (dataUrl) => {
-          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-          else resolve(dataUrl);
-        });
+        if (!isContextValid()) { reject(new Error('Extension context invalidated')); return; }
+        try {
+          chrome.runtime.sendMessage({ type: 'capture_visible_tab' }, (dataUrl) => {
+            const err = chrome.runtime && chrome.runtime.lastError;
+            if (err) reject(new Error(err.message));
+            else resolve(dataUrl);
+          });
+        } catch (e) { reject(e); }
       });
 
       if (!fullPage) {
@@ -726,11 +758,15 @@
   });
 
   // Notify background when page loads
-  chrome.runtime.sendMessage({
-    type: 'content_page_loaded',
-    url: window.location.href,
-    title: document.title
-  });
+  if (isContextValid()) {
+    try {
+      chrome.runtime.sendMessage({
+        type: 'content_page_loaded',
+        url: window.location.href,
+        title: document.title
+      });
+    } catch {}
+  }
 
   console.log('[RBC] Content script ready');
 })();

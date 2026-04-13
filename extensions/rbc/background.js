@@ -387,8 +387,9 @@ class RBCConnectionManager {
       });
     };
 
-    // ── Background-handled commands (chrome.tabs API required) ──
+    // ── Background-handled commands (chrome.tabs / chrome.downloads API required) ──
     switch (method) {
+      // ── Navigation ────────────────────────────────────────────
       case 'browser.navigate':
         resolveTab((tabId) => {
           if (!tabId) { respondErr('No active tab'); return; }
@@ -399,14 +400,58 @@ class RBCConnectionManager {
         });
         return;
 
-      case 'browser.newTab':
+      case 'browser.back':
+        resolveTab((tabId) => {
+          if (!tabId) { respondErr('No active tab'); return; }
+          chrome.tabs.goBack(tabId, () => {
+            if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+            else respondOk({ success: true });
+          });
+        });
+        return;
+
+      case 'browser.forward':
+        resolveTab((tabId) => {
+          if (!tabId) { respondErr('No active tab'); return; }
+          chrome.tabs.goForward(tabId, () => {
+            if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+            else respondOk({ success: true });
+          });
+        });
+        return;
+
+      case 'browser.reload':
+        resolveTab((tabId) => {
+          if (!tabId) { respondErr('No active tab'); return; }
+          chrome.tabs.reload(tabId, { bypassCache: !!params?.bypassCache }, () => {
+            if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+            else respondOk({ success: true });
+          });
+        });
+        return;
+
+      // Closes current tab (extension cannot quit the browser process itself)
+      case 'browser.close':
+        resolveTab((tabId) => {
+          if (!tabId) { respondErr('No active tab'); return; }
+          chrome.tabs.remove(tabId, () => {
+            if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+            else respondOk({ success: true, note: 'closed current tab' });
+          });
+        });
+        return;
+
+      // ── Tabs (aligned with BAP's tabs.* naming) ──────────────
+      case 'tabs.create':
+      case 'browser.newTab': // legacy alias
         chrome.tabs.create({ url: params?.url || 'about:blank', active: params?.active !== false }, (tab) => {
           if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
           else respondOk({ success: true, tabId: tab.id, url: tab.url || tab.pendingUrl });
         });
         return;
 
-      case 'browser.closeTab': {
+      case 'tabs.close':
+      case 'browser.closeTab': { // legacy alias
         const doClose = (tabId) => {
           chrome.tabs.remove(tabId, () => {
             if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
@@ -418,7 +463,8 @@ class RBCConnectionManager {
         return;
       }
 
-      case 'browser.switchTab':
+      case 'tabs.switch':
+      case 'browser.switchTab': // legacy alias
         if (!params?.tabId) { respondErr('tabId required'); return; }
         chrome.tabs.update(params.tabId, { active: true }, (tab) => {
           if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
@@ -426,9 +472,37 @@ class RBCConnectionManager {
         });
         return;
 
-      case 'browser.listTabs':
-        chrome.tabs.query({ currentWindow: true }, (tabs) => {
-          respondOk({ tabs: tabs.map(t => ({ tabId: t.id, url: t.url, title: t.title, active: t.active, index: t.index })) });
+      case 'tabs.list':
+      case 'browser.listTabs': // legacy alias
+        chrome.tabs.query(params?.allWindows ? {} : { currentWindow: true }, (tabs) => {
+          respondOk({
+            tabs: tabs.map(t => ({
+              tabId: t.id, url: t.url, title: t.title, active: t.active,
+              index: t.index, windowId: t.windowId, pinned: t.pinned, status: t.status
+            }))
+          });
+        });
+        return;
+
+      // ── Downloads ────────────────────────────────────────────
+      case 'downloads.list':
+        chrome.downloads.search(params?.query || { limit: 50, orderBy: ['-startTime'] }, (items) => {
+          if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+          else respondOk({
+            downloads: items.map(d => ({
+              id: d.id, filename: d.filename, url: d.url, mime: d.mime,
+              state: d.state, totalBytes: d.totalBytes, bytesReceived: d.bytesReceived,
+              startTime: d.startTime, endTime: d.endTime, exists: d.exists
+            }))
+          });
+        });
+        return;
+
+      case 'file.delete':
+        if (!params?.id) { respondErr('id required'); return; }
+        chrome.downloads.removeFile(Number(params.id), () => {
+          if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+          else respondOk({ success: true });
         });
         return;
 
