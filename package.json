@@ -1,0 +1,23 @@
+{
+  "name": "remote-browser-controller",
+  "version": "1.0.0",
+  "description": "远程浏览器控制能力，有两种实现方式： 1. **Chrome Extension (RBC)** — 浏览器插件方式 2. **Playwright** — Playwright 直接控制浏览器",
+  "main": "index.js",
+  "scripts": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/juejixiaohaipi/remote-browser-controller.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/juejixiaohaipi/remote-browser-controller/issues"
+  },
+  "homepage": "https://github.com/juejixiaohaipi/remote-browser-controller#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@types/node": "^25.6.0"
+  }
+}

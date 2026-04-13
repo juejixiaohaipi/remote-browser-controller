@@ -17,11 +17,13 @@
 
 ```bash
 # 方案 1: Chrome Extension (RBC) 直连 BAP
-# Chrome 加载 browsers/rbc-extension/
+# Chrome 加载 extensions/rbc/
 # 插件 popup 连接 ws://192.168.0.100:3000/ws
 
 # 方案 2: Playwright 直连 BAP
-node playwright-relay.js --browser chromium
+cd relay
+./start.sh
+# 或手动: node playwright-relay.js
 ```
 
 ---
@@ -45,7 +47,7 @@ BAP Gateway: ws://192.168.0.100:3000
 
 **启动:**
 ```bash
-# Chrome 安装并加载 browsers/rbc-extension/
+# Chrome 安装并加载 extensions/rbc/
 # 插件 popup 连接 ws://192.168.0.100:3000/ws
 ```
 
@@ -65,10 +67,12 @@ Playwright (chromium headless)
 - ✅ 不需要 Chrome 插件，不受 MV3 service worker 影响
 - ✅ 直连 BAP，少一跳，更简单
 
+**配置:** 编辑 `.env` 文件
+
 **启动:**
 ```bash
-cd /home/jerry/projects/remote-browser-controller/relay
-node playwright-relay.js --browser chromium
+cd relay
+./start.sh
 ```
 
 ---
@@ -77,43 +81,10 @@ node playwright-relay.js --browser chromium
 
 ```
 relay/
-├── relay.js              # relay 中转服务（给其他跨网络场景用）
-├── cdp-relay.js          # CDP bridge（备用方案）
+├── .env                  # 配置文件（gateway, token, device 等）
+├── start.sh              # 启动脚本（读取 .env）
 ├── playwright-relay.js   # Playwright 直连 BAP（方案 2）
-├── start.sh              # 启动脚本
-└── browsers/
-    ├── rbc-extension/       # RBC Chrome 插件（方案 1）
-    └── openclaw-extension/  # OpenClaw Browser Relay（参考）
-```
-
----
-
-## relay.js 协议
-
-relay.js 同时支持两种 extension 连接协议：
-
-### 协议 A: BAP auth (旧版 / 我们的实现)
-```json
-// Extension → relay.js
-{ "type": "auth", "token": "XERJS7O4y...", "deviceId": "rbc-jerrypc" }
-
-// relay.js → BAP Gateway
-{ "type": "auth", "token": "XERJS7O4y...", "deviceId": "rbc-jerrypc", ... }
-
-// BAP → Extension (via relay)
-{ "type": "command", "id": 1, "method": "...", "params": {} }
-```
-
-### 协议 B: OpenClaw connect (OpenClaw Browser Relay 扩展用)
-```json
-// BAP Gateway → relay.js
-{ "type": "event", "event": "connect.challenge", "payload": {...} }
-
-// relay.js → Extension
-{ "type": "event", "event": "connect.challenge", "payload": {...} }
-
-// Extension → relay.js
-{ "type": "req", "id": "...", "method": "connect", "params": {...} }
+└── package.json
 ```
 
 ---
@@ -124,9 +95,9 @@ BAP Gateway 使用以下命令格式：
 
 ```json
 // Client → BAP Gateway
-{ "type": "command", "id": 1, "method": "tabs.list", "params": {}, "targetDeviceId": "cdp-bridge-jerrypc" }
+{ "type": "command", "id": 1, "method": "tabs.list", "params": {}, "targetDeviceId": "playwright-jerrypc" }
 
-// BAP Gateway → Device (cdp-relay.js / playwright-relay.js)
+// BAP Gateway → Device (playwright-relay.js)
 { "type": "command", "id": 1, "method": "tabs.list", "params": {} }
 
 // Device → BAP Gateway

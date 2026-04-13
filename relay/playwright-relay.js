@@ -32,7 +32,7 @@ const argv = (() => {
 const BAP_GATEWAY  = argv['gateway']    || process.env.BAP_GATEWAY  || 'ws://127.0.0.1:3000/ws';
 const DEVICE_ID    = argv['device-id']  || process.env.DEVICE_ID   || 'playwright-jerrypc';
 const DEVICE_NAME  = argv['device-name']|| process.env.DEVICE_NAME || 'Playwright-JerryPC';
-const BROWSER_TYPE = argv['browser']   || process.env.BROWSER      || 'chromium';
+const BROWSER_TYPE = argv['browser'] || process.env.BROWSER || 'chromium';
 const AUTH_TOKEN   = argv['token']      || process.env.BAP_TOKEN   || 'XERJS7O4y_NF4fzyAlalN3i0udAd6wuT';
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -157,7 +157,7 @@ async function execCommand(method, params) {
       }
       await page.waitForTimeout(500);
       const screenshot = await page.screenshot({ type: 'png' });
-      return { data: screenshot.toString('base64') };
+      return { screenshot: `data:image/png;base64,${screenshot.toString('base64')}` };
     }
 
     // Form / Input

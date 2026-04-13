@@ -7,3 +7,10 @@ screenshots/
 .env.local
 .DS_Store
 .tool-versions
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
