@@ -14,6 +14,8 @@
  *                            [--browser chromium|firefox|webkit]
  */
 
+require('dotenv').config();
+
 const { chromium, firefox, webkit } = require('playwright');
 
 // ── CLI args ─────────────────────────────────────────────────────────────────
