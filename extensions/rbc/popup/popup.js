@@ -153,17 +153,31 @@ async function connect() {
   await saveConfig();
   addLog(`连接 ${el.serverUrl.value}...`);
 
-  // Send message and wait for async response via Promise
+  // Send message and wait for async response via Promise.
+  //
+  // CRITICAL: In Chrome MV3, chrome.runtime.sendMessage() returns false when the
+  // Service Worker is suspended/not running. However, the message IS queued and
+  // the callback WILL fire once the SW starts up and registers its listener.
+  // So we must ALWAYS wait for the callback — never reject on false return value.
+  // Retrying would only restart the SW each time (making things worse).
   try {
     const resp = await new Promise((resolve, reject) => {
-      const ok = chrome.runtime.sendMessage({ type: 'popup_connect' }, (resp) => {
+      let settled = false;
+
+      // sendMessage returns false when SW is cold — IGNORE this, still wait for callback
+      chrome.runtime.sendMessage({ type: 'popup_connect' }, (resp) => {
+        if (settled) return; // already timed out or errored
+        settled = true;
         if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
         else resolve(resp);
       });
-      if (!ok) reject(new Error('sendMessage returned false'));
-      // Timeout after 15s
-      setTimeout(() => reject(new Error('Connection timeout (15s)')), 15000);
+
+      // Give the SW enough time to cold-start (~15s should be more than enough)
+      setTimeout(() => {
+        if (!settled) { settled = true; reject(new Error('Connection timeout (15s) — Service Worker did not respond')); }
+      }, 15000);
     });
+
     if (resp?.success) {
       addLog('连接成功，等待认证...');
     } else {
@@ -186,12 +200,18 @@ function disconnect() {
 // ─── Events from background ────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type !== 'popup_update') return;
-  if (msg.status) updateStatus(msg.status, msg.text);
+  // Background broadcasts multiple message types — handle all of them
+  const statusTypes = ['popup_update', 'status', 'connected', 'disconnected', 'reconnecting', 'error'];
+  if (!statusTypes.includes(msg.type)) return;
+
+  if (msg.status) updateStatus(msg.status, msg.text || msg.statusText);
+  if (msg.type === 'connected') { updateStatus('connected', 'Connected'); addLog('连接成功！'); }
+  if (msg.type === 'disconnected') { updateStatus('disconnected', 'Disconnected'); addLog(msg.text || 'Disconnected'); }
+  if (msg.type === 'reconnecting') { updateStatus('reconnecting', `Reconnecting... (${msg.attempt})`); addLog(`重连中... (${msg.attempt})`, 'warn'); }
   if (msg.sessionId) el.sessId.textContent = msg.sessionId;
   if (msg.deviceName) el.sessDevice.textContent = msg.deviceName;
   if (msg.deviceId) el.sessDeviceId.textContent = msg.deviceId;
-  if (msg.text) addLog(msg.text);
+  if (msg.text || msg.statusText) addLog(msg.text || msg.statusText);
   if (msg.url) { el.currentUrl.textContent = msg.url.slice(0, 40); el.currentUrl.title = msg.url; }
 });
 

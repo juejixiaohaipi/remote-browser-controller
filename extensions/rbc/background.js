@@ -74,10 +74,15 @@ class OffscreenClient {
           justification: 'Maintain persistent WebSocket connection to BAP Gateway'
         });
       } catch (err) {
-        console.error('[RBC] createDocument failed:', err.message);
-        // Don't throw — schedule retry and let service worker stay alive
-        setTimeout(() => this._scheduleOffscreenRetry(), 3000);
-        return;
+        // MV3 race condition: hasDocument() returns false but doc actually exists.
+        // If so, skip creation and proceed to connect.
+        if (err.message?.includes('single offscreen') || err.message?.includes('only a single')) {
+          console.log('[RBC] Offscreen doc already exists (race), proceeding to connect');
+        } else {
+          console.error('[RBC] createDocument failed:', err.message);
+          setTimeout(() => this._scheduleOffscreenRetry(), 3000);
+          return;
+        }
       }
       await new Promise(r => setTimeout(r, 1000));
     }
@@ -164,13 +169,42 @@ class OffscreenClient {
     try { await this._sendPortMsg({ action: 'stop' }); } catch {}
   }
 
+  /** Probe port health by sending a status check; rebuild if no response */
+  async _probeOrRebuild() {
+    if (!this._port) {
+      console.log('[RBC] No port, ensuring offscreen...');
+      await this._ensureOffscreen();
+      return true;
+    }
+    // Quick health check
+    try {
+      const resp = await this._sendPortMsg({ action: 'status' });
+      if (resp?.ok) return true;
+    } catch {}
+    console.warn('[RBC] Port unhealthy, rebuilding...');
+    this._port = null;
+    await this._ensureOffscreen();
+    return true;
+  }
+
   async send(data) {
-    const resp = await this._sendPortMsg({ action: 'send', data });
+    let resp = await this._sendPortMsg({ action: 'send', data });
+    if (!resp?.ok) {
+      console.warn('[RBC] send failed, rebuilding port...');
+      this._port = null;
+      await this._ensureOffscreen();
+      resp = await this._sendPortMsg({ action: 'send', data });
+    }
     return resp?.ok ?? false;
   }
 
   async status() {
-    const resp = await this._sendPortMsg({ action: 'status' });
+    let resp = await this._sendPortMsg({ action: 'status' });
+    if (!resp) {
+      this._port = null;
+      await this._ensureOffscreen();
+      resp = await this._sendPortMsg({ action: 'status' });
+    }
     return resp?.connected ?? false;
   }
 
@@ -357,26 +391,36 @@ class RBCConnectionManager {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
 
-  _handleCommand(id, method, params, sendResponse) {
+  async _handleCommand(id, method, params, sendResponse) {
+    const self = this;
+    const respondOk = (result) => {
+      console.log('[RBC] Command OK:', method, JSON.stringify(result)?.slice(0,200));
+      try { sendResponse({ id, result }); } catch {}
+    };
+    const respondErr = (msg) => { try { sendResponse({ id, error: { code: -32000, message: msg } }); } catch {} };
+
+    // CRITICAL: Rebuild offscreen port if SW was idle-killed by MV3.
+    // After SW restart, the old MessagePort appears connected but silently drops messages.
+    await self._offscreen._probeOrRebuild();
+
     // Helper: resolve target tab (supports optional params.tabId)
     const resolveTab = (callback) => {
       if (params?.tabId) { callback(params.tabId); }
       else { chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => callback(tabs[0]?.id || null)); }
     };
 
-    const respondOk = (result) => { try { sendResponse({ id, result }); } catch {} };
-    const respondErr = (msg) => { try { sendResponse({ id, error: { code: -32000, message: msg } }); } catch {} };
-
     // Helper: forward command to content script in target tab
     const forwardToContent = () => {
       resolveTab((tabId) => {
         if (!tabId) { respondErr('No active tab'); return; }
+        console.log('[RBC] Forwarding to tab', tabId, ':', method);
         let done = false;
         const timeout = setTimeout(() => {
           if (!done) { done = true; respondErr(`Timeout: ${method}`); }
         }, 60000);
 
         chrome.tabs.sendMessage(tabId, { type: 'execute', command: method, params: params || {} }, (resp) => {
+          console.log('[RBC] Tab response:', tabId, chrome.runtime.lastError?.message || 'ok', JSON.stringify(resp)?.slice(0,500));
           if (done) return;
           done = true;
           clearTimeout(timeout);
