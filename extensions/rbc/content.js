@@ -17,8 +17,21 @@
       return;
     }
     try {
-      reconnectCount = 0; // Reset on successful connection
+      chrome.runtime.lastError = null;
       rbcPort = chrome.runtime.connect({ name: 'rbc-tab' });
+      // Check lastError — MV3 SW restart causes "Extension context invalidated" here
+      const lastErr = chrome.runtime.lastError?.message;
+      if (lastErr) {
+        console.error(`[RBC] connect lastError: ${lastErr}`);
+        reconnectCount++;
+        if (lastErr.includes('Extension context') || reconnectCount >= MAX_RECONNECT) {
+          console.error(`[RBC] Extension context invalid — not retrying (SW may be dead). Try reloading the extension.`);
+          return;
+        }
+        setTimeout(connectToBackground, Math.min(5000 * Math.pow(2, reconnectCount), 30000));
+        return;
+      }
+      reconnectCount = 0;
       rbcPort.onDisconnect.addListener(() => {
         rbcPort = null;
         reconnectCount++;
@@ -28,14 +41,14 @@
         setTimeout(connectToBackground, delay);
       });
       rbcPort.onMessage.addListener((msg) => {
-        // 'ping' from background — respond to keep connection alive
+        reconnectCount = 0; // Reset only after confirmed communication
         if (msg.type === 'ping') {
           try { rbcPort.postMessage({ type: 'pong' }); } catch {}
         }
       });
     } catch (err) {
       reconnectCount++;
-      console.error(`[RBC] Failed to connect port (attempt ${reconnectCount}/${MAX_RECONNECT}):`, err);
+      console.error(`[RBC] Failed to connect port (attempt ${reconnectCount}/${MAX_RECONNECT}):`, err.message);
       if (reconnectCount < MAX_RECONNECT) {
         setTimeout(connectToBackground, 5000);
       }
@@ -44,10 +57,13 @@
   connectToBackground();
 
   // ── Dialog interceptor
-  let pendingDialogResolve = null;
+  // Native alert/confirm/prompt are synchronous and cannot wait for remote commands.
+  // We auto-dismiss them and track the last dialog so the server can query it.
+  let lastDialog = null;
 
   function notifyDialog(dialogType, message) {
     console.log('[RBC] Dialog intercepted:', dialogType, message);
+    lastDialog = { dialogType, message: String(message), timestamp: Date.now() };
     chrome.runtime.sendMessage({
       type: 'content_dialog',
       dialogType,
@@ -88,6 +104,19 @@
     return document.querySelector(ref);
   }
 
+  // Visibility check: CSS display/visibility/opacity + size + viewport
+  function isElementVisible(el) {
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none') return false;
+    if (style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+    if (parseFloat(style.opacity) === 0) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 4 || rect.height < 4) return false;
+    if (rect.bottom < 0 || rect.right < 0) return false;
+    if (rect.top > window.innerHeight && rect.left > window.innerWidth) return false;
+    return true;
+  }
+
   // Build accessibility snapshot with stable e# refs
   function buildSnapshot() {
     const root = document.body;
@@ -99,8 +128,8 @@
 
     // Find all interactive/focusable elements
     const interactiveSelectors = [
-      'a[href]', 'button:not([disabled])', 'input:not([type=hidden])',
-      'select:not([disabled])', 'textarea:not([disabled])',
+      'a[href]', 'button', 'input:not([type=hidden])',
+      'select', 'textarea',
       '[contenteditable]', '[role=button]', '[role=link]', '[role=menuitem]',
       '[role=tab]', '[role=radio]', '[role=checkbox]', '[role=switch]',
       '[role=textbox]', '[role=searchbox]', '[role=combobox]',
@@ -116,19 +145,37 @@
           if (seenEls.has(el)) continue;
           seenEls.add(el);
 
+          if (!isElementVisible(el)) continue;
           const rect = el.getBoundingClientRect();
-          if (rect.width < 4 || rect.height < 4) continue; // invisible
 
           const eRef = 'e' + snapshotState.nextId++;
           snapshotState.eRefMap.set(eRef, el);
 
-          const role = el.getAttribute('role')
-            || (el.tagName === 'INPUT' ? 'textbox' : '')
-            || el.tagName.toLowerCase();
+          const implicitRole = (() => {
+            const tag = el.tagName;
+            if (tag === 'A') return 'link';
+            if (tag === 'BUTTON') return 'button';
+            if (tag === 'SELECT') return 'combobox';
+            if (tag === 'TEXTAREA') return 'textbox';
+            if (tag === 'INPUT') {
+              const t = (el.type || 'text').toLowerCase();
+              if (t === 'checkbox') return 'checkbox';
+              if (t === 'radio') return 'radio';
+              if (t === 'range') return 'slider';
+              if (t === 'button' || t === 'submit' || t === 'reset') return 'button';
+              return 'textbox';
+            }
+            return tag.toLowerCase();
+          })();
+          const role = el.getAttribute('role') || implicitRole;
 
           const inputType = el.type || '';
+          const labelledById = el.getAttribute('aria-labelledby');
+          const labelledByText = labelledById
+            ? labelledById.split(/\s+/).map(id => document.getElementById(id)?.textContent?.trim()).filter(Boolean).join(' ')
+            : '';
           const label = el.getAttribute('aria-label')
-            || el.getAttribute('aria-labelledby')
+            || labelledByText
             || (el.labels?.[0]?.textContent || '').trim()
             || el.textContent?.trim().slice(0, 80)
             || '';
@@ -137,7 +184,7 @@
             eRef,
             tag: el.tagName.toLowerCase(),
             id: el.id || undefined,
-            class: el.className.slice(0, 80) || undefined,
+            class: (typeof el.className === 'string' ? el.className : el.getAttribute('class') || '').slice(0, 80) || undefined,
             role,
             type: inputType || undefined,
             label: label || undefined,
@@ -145,6 +192,11 @@
             value: el.value !== undefined && el.value !== '' ? String(el.value).slice(0, 60) : undefined,
             href: el.href !== undefined ? (el.tagName === 'A' ? (el.href.length > 100 ? el.href.slice(0, 100) + '...' : el.href) : undefined) : undefined,
             rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+            disabled: el.disabled === true ? true : undefined,
+            checked: (el.type === 'checkbox' || el.type === 'radio') ? el.checked : undefined,
+            readOnly: el.readOnly === true ? true : undefined,
+            required: el.required === true ? true : undefined,
+            ariaExpanded: el.getAttribute('aria-expanded') || undefined,
           });
         }
       } catch {}
@@ -178,19 +230,26 @@
       const el = q(selector);
       el.focus();
 
-      // Clear existing value
-      el.value = '';
-
-      // Simulate typing character by character
-      for (const char of text) {
-        const charCode = char.charCodeAt(0);
-        el.dispatchEvent(new KeyboardEvent('keydown', { key: char, charCode, bubbles: true }));
-        el.value += char;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new KeyboardEvent('keyup', { key: char, charCode, bubbles: true }));
+      if (el.isContentEditable) {
+        // contenteditable elements don't have .value
+        el.textContent = '';
+        for (const char of text) {
+          el.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+          el.textContent += char;
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: char }));
+          el.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+        }
+      } else {
+        el.value = '';
+        for (const char of text) {
+          const charCode = char.charCodeAt(0);
+          el.dispatchEvent(new KeyboardEvent('keydown', { key: char, charCode, bubbles: true }));
+          el.value += char;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new KeyboardEvent('keyup', { key: char, charCode, bubbles: true }));
+        }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
       }
-
-      el.dispatchEvent(new Event('change', { bubbles: true }));
 
       if (pressEnter) {
         el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
@@ -225,6 +284,73 @@
       return { success: true };
     },
 
+    'keyboard.press': async ({ key, modifiers, selector }) => {
+      const target = selector ? q(selector) : (document.activeElement || document.body);
+      const modList = modifiers || [];
+      const keyMap = {
+        'Tab': { key: 'Tab', code: 'Tab', keyCode: 9 },
+        'Enter': { key: 'Enter', code: 'Enter', keyCode: 13 },
+        'Escape': { key: 'Escape', code: 'Escape', keyCode: 27 },
+        'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8 },
+        'Delete': { key: 'Delete', code: 'Delete', keyCode: 46 },
+        'ArrowUp': { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
+        'ArrowDown': { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+        'ArrowLeft': { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+        'ArrowRight': { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+        'Home': { key: 'Home', code: 'Home', keyCode: 36 },
+        'End': { key: 'End', code: 'End', keyCode: 35 },
+        'PageUp': { key: 'PageUp', code: 'PageUp', keyCode: 33 },
+        'PageDown': { key: 'PageDown', code: 'PageDown', keyCode: 34 },
+        'Space': { key: ' ', code: 'Space', keyCode: 32 },
+      };
+      const mapped = keyMap[key] || { key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key, keyCode: key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0 };
+      const eventInit = {
+        ...mapped,
+        bubbles: true,
+        cancelable: true,
+        ctrlKey: modList.includes('Control') || modList.includes('Ctrl'),
+        shiftKey: modList.includes('Shift'),
+        altKey: modList.includes('Alt'),
+        metaKey: modList.includes('Meta') || modList.includes('Command'),
+      };
+      target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+      target.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+      target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+
+      // Tab: manually move focus since dispatched events don't trigger default behavior
+      if (key === 'Tab') {
+        const focusable = [...document.querySelectorAll(
+          'a[href],button:not([disabled]),input:not([type=hidden]):not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+        )];
+        const idx = focusable.indexOf(target);
+        const next = eventInit.shiftKey ? focusable[idx - 1] : focusable[idx + 1];
+        if (next) next.focus();
+      }
+      return { success: true };
+    },
+
+    'mouse.click': async ({ x, y, button = 'left', clickCount = 1 }) => {
+      const buttonMap = { left: 0, middle: 1, right: 2 };
+      const buttonNum = buttonMap[button] ?? 0;
+      const el = document.elementFromPoint(x, y);
+      const target = el || document.body;
+      const eventInit = {
+        clientX: x, clientY: y,
+        screenX: x + window.screenX, screenY: y + window.screenY,
+        button: buttonNum, buttons: 1 << buttonNum,
+        bubbles: true, cancelable: true, view: window,
+      };
+      for (let i = 0; i < clickCount; i++) {
+        target.dispatchEvent(new MouseEvent('mousedown', eventInit));
+        target.dispatchEvent(new MouseEvent('mouseup', eventInit));
+        target.dispatchEvent(new MouseEvent('click', { ...eventInit, detail: i + 1 }));
+      }
+      if (clickCount === 2) {
+        target.dispatchEvent(new MouseEvent('dblclick', eventInit));
+      }
+      return { success: true, element: el ? el.tagName.toLowerCase() : null };
+    },
+
     'element.scroll': async ({ selector, x, y }) => {
       if (selector) {
         const el = q(selector);
@@ -237,9 +363,17 @@
 
     'element.clear': async ({ selector }) => {
       const el = q(selector);
-      el.value = '';
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      if (el.isContentEditable) {
+        el.textContent = '';
+        el.innerHTML = '';
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContent' }));
+      } else {
+        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (nativeSetter) { nativeSetter.call(el, ''); } else { el.value = ''; }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
       return { success: true };
     },
 
@@ -259,7 +393,8 @@
         if (!el) { results.push({ selector: sel, error: `Element not found: ${sel}` }); continue; }
         el.focus();
         el.value = '';
-        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
         if (nativeSetter) { nativeSetter.call(el, val); } else { el.value = val; }
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -295,16 +430,51 @@
     },
 
     'page.screenshot': async ({ fullPage }) => {
-      // Use the Capture Visible Tab API
-      return new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({ type: 'capture_visible_tab', fullPage }, (dataUrl) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-          } else {
-            resolve({ screenshot: dataUrl });
-          }
+      // Helper: capture current viewport via background
+      const captureViewport = () => new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'capture_visible_tab' }, (dataUrl) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(dataUrl);
         });
       });
+
+      if (!fullPage) {
+        const dataUrl = await captureViewport();
+        return { screenshot: dataUrl };
+      }
+
+      // Full-page: scroll-and-stitch
+      const originalX = window.scrollX;
+      const originalY = window.scrollY;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const fullWidth = Math.max(document.documentElement.scrollWidth, vw);
+      const fullHeight = Math.max(document.documentElement.scrollHeight, vh);
+      const rows = Math.ceil(fullHeight / vh);
+      const cols = Math.ceil(fullWidth / vw);
+      const tiles = [];
+
+      for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+          window.scrollTo(col * vw, row * vh);
+          await new Promise(r => setTimeout(r, 150));
+          const dataUrl = await captureViewport();
+          tiles.push({ dataUrl, x: col * vw, y: row * vh });
+        }
+      }
+      window.scrollTo(originalX, originalY);
+
+      // Stitch on canvas
+      const canvas = document.createElement('canvas');
+      canvas.width = fullWidth;
+      canvas.height = fullHeight;
+      const ctx = canvas.getContext('2d');
+      for (const tile of tiles) {
+        const img = new Image();
+        await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = tile.dataUrl; });
+        ctx.drawImage(img, tile.x, tile.y);
+      }
+      return { screenshot: canvas.toDataURL('image/png'), fullWidth, fullHeight };
     },
 
     'page.getCookies': async () => {
@@ -316,23 +486,30 @@
     },
 
     'page.evaluate': async ({ fn, args }) => {
-      // eslint-disable-next-line no-new-function
-      const func = new Function('return ' + fn)();
-      const result = func(...(args || []));
-      return { result };
+      // Runs in page context via injected script (can access page JS variables).
+      return new Promise((resolve, reject) => {
+        const callbackId = '_rbc_eval_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+        const handler = (event) => {
+          if (event.data?.type === callbackId) {
+            window.removeEventListener('message', handler);
+            if (event.data.error) reject(new Error(event.data.error));
+            else resolve({ result: event.data.result });
+          }
+        };
+        window.addEventListener('message', handler);
+        const script = document.createElement('script');
+        script.textContent = `(function(){try{const fn=(${fn});const r=fn(${(args||[]).map(a=>JSON.stringify(a)).join(',')});window.postMessage({type:'${callbackId}',result:typeof r==='undefined'?null:JSON.parse(JSON.stringify(r))},'*')}catch(e){window.postMessage({type:'${callbackId}',error:e.message},'*')}})()`;
+        document.documentElement.appendChild(script);
+        script.remove();
+        // Timeout fallback
+        setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('page.evaluate timeout')); }, 10000);
+      });
     },
 
     // Form operations
     'form.fill': async ({ data }) => {
-      for (const [sel, value] of Object.entries(data)) {
-        const el = resolveElement(sel);
-        if (el) {
-          el.value = value;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }
-      return { success: true };
+      // Delegate to page.fill which uses native setter for React/Vue compatibility
+      return handlers['page.fill']({ data });
     },
 
     'form.submit': async ({ selector }) => {
@@ -349,32 +526,24 @@
     },
 
     'form.clear': async ({ selector }) => {
-      const el = q(selector);
-      el.value = '';
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      return { success: true };
+      return handlers['element.clear']({ selector });
     },
 
     // Dialog operations
     'dialog.accept': async () => {
-      if (pendingDialogResolve) {
-        pendingDialogResolve(true);
-        pendingDialogResolve = null;
-      }
-      return { success: true };
+      const dialog = lastDialog;
+      lastDialog = null;
+      return { success: true, dialog };
     },
 
     'dialog.dismiss': async () => {
-      if (pendingDialogResolve) {
-        pendingDialogResolve(false);
-        pendingDialogResolve = null;
-      }
-      return { success: true };
+      const dialog = lastDialog;
+      lastDialog = null;
+      return { success: true, dialog };
     },
 
     'dialog.getText': async () => {
-      // Dialog text is handled separately
-      return { text: '' };
+      return { text: lastDialog?.message || '', dialogType: lastDialog?.dialogType || null };
     },
 
     // Wait operations
@@ -419,6 +588,39 @@
       return { success: true, url: location.href };
     },
 
+    'wait.forNetworkIdle': async ({ timeout = 30000, idleTime = 500 }) => {
+      return new Promise((resolve, reject) => {
+        let lastActivity = Date.now();
+        let checkTimer = null;
+        let observer = null;
+
+        const cleanup = () => {
+          if (checkTimer) clearInterval(checkTimer);
+          if (observer) observer.disconnect();
+        };
+
+        const timeoutId = setTimeout(() => {
+          cleanup();
+          reject(new Error('Network idle timeout'));
+        }, timeout);
+
+        if (typeof PerformanceObserver !== 'undefined') {
+          try {
+            observer = new PerformanceObserver(() => { lastActivity = Date.now(); });
+            observer.observe({ entryTypes: ['resource'] });
+          } catch {}
+        }
+
+        checkTimer = setInterval(() => {
+          if (Date.now() - lastActivity >= idleTime) {
+            clearTimeout(timeoutId);
+            cleanup();
+            resolve({ success: true });
+          }
+        }, 100);
+      });
+    },
+
     // Frame operations — content scripts cannot switch execution context to iframes.
     // Use chrome.scripting.executeScript with frameIds from background instead.
     'frame.switch': async ({ frameId }) => {
@@ -432,13 +634,23 @@
 
     // JavaScript evaluation
     'eval.js': async ({ script }) => {
-      try {
-        // eslint-disable-next-line no-eval
-        const result = eval(script);
-        return { result, success: true };
-      } catch (err) {
-        throw new Error(`JS Error: ${err.message}`);
-      }
+      // Runs in page context via injected script (can access page JS variables).
+      return new Promise((resolve, reject) => {
+        const callbackId = '_rbc_eval_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+        const handler = (event) => {
+          if (event.data?.type === callbackId) {
+            window.removeEventListener('message', handler);
+            if (event.data.error) reject(new Error(`JS Error: ${event.data.error}`));
+            else resolve({ result: event.data.result, success: true });
+          }
+        };
+        window.addEventListener('message', handler);
+        const el = document.createElement('script');
+        el.textContent = `(function(){try{const r=(function(){${script}})();window.postMessage({type:'${callbackId}',result:typeof r==='undefined'?null:JSON.parse(JSON.stringify(r))},'*')}catch(e){window.postMessage({type:'${callbackId}',error:e.message},'*')}})()`;
+        document.documentElement.appendChild(el);
+        el.remove();
+        setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('eval.js timeout')); }, 10000);
+      });
     },
 
     // File operations
@@ -466,6 +678,20 @@
         reader.onerror = () => reject(new Error('Failed to read file'));
         reader.readAsDataURL(file);
       });
+    },
+
+    'file.upload': async ({ selector, dataUrl, filename, mimeType }) => {
+      const input = resolveElement(selector) || document.querySelector('input[type="file"]');
+      if (!input) throw new Error('No file input found: ' + (selector || 'input[type="file"]'));
+      const resp = await fetch(dataUrl);
+      const blob = await resp.blob();
+      const file = new File([blob], filename || 'upload', { type: mimeType || blob.type });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return { success: true, filename: file.name, size: file.size, type: file.type };
     }
   };
 

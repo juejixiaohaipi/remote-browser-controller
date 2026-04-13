@@ -1,13 +1,18 @@
-# Remote Browser Controller
+# Remote Browser Controller (RBC)
 
-Chrome 扩展合集，通过 WebSocket 连接 BAP Server 控制远程 Chrome 浏览器。
+远程浏览器控制能力，有两种实现方式：
+1. **Chrome Extension (RBC)** — 浏览器插件方式
+2. **Playwright** — Playwright 直接控制浏览器
 
-## 扩展列表
+所有方式均通过 WebSocket 连接 BAP Server :3000。
 
-| 扩展 | 说明 | 目录 |
+## 浏览器控制实现
+
+| 方案 | 说明 | 目录 |
 |------|------|------|
-| **RBC** | 远程浏览器控制（导航、截图、表单、鼠标等） | `extensions/rbc/` |
-| **GTool** | 密码输入框眼睛图标去除器，防误点暴露密码 | `extensions/gtool/` |
+| **RBC Extension** | Chrome 插件方式 | `extensions/rbc/` |
+| **Playwright** | Playwright 直接控制 | `relay/playwright-relay.js` |
+| **GTool** | 密码输入框眼睛图标去除器 | `extensions/gtool/` |
 
 ## 安装任意扩展
 
@@ -45,25 +50,28 @@ extensions/
 ## 架构说明
 
 ```
-Chrome Extension (RBC)
-    │
-    │  WebSocket /ws
-    ▼
-BAP Server :3000
-    │
-    ├── REST API (/api/*)    → Web UI / OpenClaw
-    └── WebSocket (/ws)      → 浏览器控制
-         └─ 合并了原 RBC Server 逻辑
+BAP Client (AI/测试脚本)
+  → WebSocket ws://192.168.0.100:3000/ws (role: client)
+        ↓
+  BAP Gateway :3000
+        ↓
+  ┌───────────────────────────────────────┐
+  │  方案 1: Chrome Extension (RBC)       │
+  │  offscreen.html ──ws──▶ BAP Gateway  │
+  │  (extensions/rbc/)                    │
+  ├───────────────────────────────────────┤
+  │  方案 2: Playwright                   │
+  │  playwright-relay.js ──ws──▶ BAP      │
+  │  (relay/playwright-relay.js)          │
+  └───────────────────────────────────────┘
 ```
-
-BAP Server 是统一入口，同时提供任务调度和浏览器控制能力。
 
 ## OpenClaw Skill
 
 RBC 的 OpenClaw Skill 位于：
 
 ```
-projects/browser-automation-platform/skills/rbc/
+/home/jerry/clawd/skills/rbc/SKILL.md
 ```
 
 ## 快速验证连接

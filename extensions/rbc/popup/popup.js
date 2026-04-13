@@ -152,9 +152,29 @@ async function connect() {
   if (!el.serverUrl.value || !el.token.value) { addLog('Please fill in server URL and token', 'error'); return; }
   await saveConfig();
   addLog(`连接 ${el.serverUrl.value}...`);
-  chrome.runtime.sendMessage({ type: 'popup_connect' }, resp => {
-    addLog(resp?.success ? 'Connection request sent' : 'Connection failed', resp?.success ? 'info' : 'error');
-  });
+
+  // Send message and wait for async response via Promise
+  try {
+    const resp = await new Promise((resolve, reject) => {
+      const ok = chrome.runtime.sendMessage({ type: 'popup_connect' }, (resp) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(resp);
+      });
+      if (!ok) reject(new Error('sendMessage returned false'));
+      // Timeout after 15s
+      setTimeout(() => reject(new Error('Connection timeout (15s)')), 15000);
+    });
+    if (resp?.success) {
+      addLog('连接成功，等待认证...');
+    } else {
+      addLog('连接失败: ' + (resp?.error || '未知错误'), 'error');
+    }
+  } catch (err) {
+    addLog('连接异常: ' + err.message, 'error');
+    if (err.message.includes('Extension context')) {
+      addLog('Extension context失效，请在 chrome://extensions 重新加载插件', 'error');
+    }
+  }
 }
 
 function disconnect() {

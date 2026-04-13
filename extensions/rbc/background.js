@@ -60,33 +60,72 @@ class OffscreenClient {
       throw new Error('chrome.offscreen API not available (Chrome 116+ required)');
     }
 
-    const hasDoc = await chrome.offscreen.hasDocument?.() ?? false;
-    if (hasDoc) {
-      if (this._port) return;
-    } else {
-      console.log('[RBC] Creating offscreen document...');
-      await chrome.offscreen.createDocument({
-        url: OFFSCREEN_URL,
-        reasons: ['WEB_RTC'],
-        justification: 'Maintain persistent WebSocket connection to BAP Gateway'
-      });
-      await new Promise(r => setTimeout(r, 500));
-    }
+    // If port already exists and is valid, we're done
+    if (this._port) return;
 
-    // Establish named port connection to offscreen
-    if (!this._port) {
-      console.log('[RBC] Connecting port to offscreen...');
+    // Check if offscreen document already exists
+    const hasDoc = await chrome.offscreen.hasDocument?.() ?? false;
+    if (!hasDoc) {
+      console.log('[RBC] Creating offscreen document...');
       try {
-        this._port = chrome.runtime.connect(chrome.runtime.id, { name: OFFSCREEN_PORT_NAME });
-        this._port.onMessage.addListener((msg) => this._handlePortMessage(msg));
-        this._port.onDisconnect.addListener(() => {
-          this._port = null;
-          this._emit('offscreen_dead', {});
+        await chrome.offscreen.createDocument({
+          url: OFFSCREEN_URL,
+          reasons: ['WEB_RTC'],
+          justification: 'Maintain persistent WebSocket connection to BAP Gateway'
         });
       } catch (err) {
-        console.error('[RBC] Failed to connect to offscreen:', err);
-        throw err;
+        console.error('[RBC] createDocument failed:', err.message);
+        // Don't throw — schedule retry and let service worker stay alive
+        setTimeout(() => this._scheduleOffscreenRetry(), 3000);
+        return;
       }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    // Try to connect to offscreen
+    if (!this._port) {
+      console.log('[RBC] Connecting port to offscreen...');
+      // chrome.runtime.connect can fail with "Extension context invalidated"
+      // when the service worker was just restarted — schedule retry and return
+      let port = null;
+      chrome.runtime.lastError = null;
+      try {
+        port = chrome.runtime.connect(chrome.runtime.id, { name: OFFSCREEN_PORT_NAME });
+      } catch (err) {
+        // Synchronous throw — extremely rare but handle it
+        console.error('[RBC] connect() threw synchronously:', err.message);
+        setTimeout(() => this._scheduleOffscreenRetry(), 2000);
+        return;
+      }
+
+      // Check lastError AFTER connect — this is the most common failure mode in MV3
+      const lastErr = chrome.runtime.lastError?.message;
+      if (lastErr) {
+        console.error('[RBC] connect lastError:', lastErr);
+        // Port was created but is immediately dead — release it so hasDocument stays accurate
+        try { port?.disconnect(); } catch {}
+        setTimeout(() => this._scheduleOffscreenRetry(), 2000);
+        return;
+      }
+
+      this._port = port;
+      this._port.onMessage.addListener((msg) => this._handlePortMessage(msg));
+      this._port.onDisconnect.addListener(() => {
+        this._port = null;
+        this._emit('offscreen_dead', {});
+        // Automatically retry after disconnect
+        setTimeout(() => this._scheduleOffscreenRetry(), 2000);
+      });
+      console.log('[RBC] Offscreen port established');
+    }
+  }
+
+  _scheduleOffscreenRetry() {
+    if (!this._port && this.config.autoConnect && this.config.serverUrl && this.config.token) {
+      console.log('[RBC] Retrying offscreen connection...');
+      this._ensureOffscreen().catch(err => {
+        console.error('[RBC] Offscreen retry failed:', err.message);
+      });
     }
   }
 
@@ -156,13 +195,11 @@ class RBCConnectionManager {
     this.config = { serverUrl: '', token: '', deviceName: '', deviceId: '', autoConnect: false };
     this.status = 'disconnected';
     this.statusText = 'Not connected';
-    this._commandWaiters = new Map();
     this._offscreen = new OffscreenClient();
 
     // Offscreen events → update local state
     this._offscreen.on('connected', () => {
       this.connected = true;
-      this.reconnectAttempts = 0;
       this._updateStatus('connected', 'Connected');
       this._broadcast({ type: 'connected', sessionId: this.sessionId });
       this._startHeartbeat();
@@ -172,7 +209,6 @@ class RBCConnectionManager {
       this.connected = false;
       this.sessionId = null;
       this._stopHeartbeat();
-      this._clearPendingCommands();
       this._updateStatus('disconnected', `Connection closed (${code})`);
       // NO reconnect here — offscreen handles it
     });
@@ -235,6 +271,7 @@ class RBCConnectionManager {
     } catch (err) {
       console.error('[RBC] connect() error:', err);
       this._updateStatus('error', 'Offscreen init failed: ' + err.message);
+      // Don't throw — caller handles it gracefully; offscreen retry will be scheduled
     }
   }
 
@@ -252,31 +289,29 @@ class RBCConnectionManager {
       case 'event': this._handleEvent(msg.event, msg.data); break;
       case 'command':
         this._handleCommand(msg.id, msg.method, msg.params, (response) => {
-          this._send({ type: 'command_response', id: msg.id, ...response });
+          this._send({ type: 'command_response', id: msg.id, ...response })
+            .then(ok => { if (!ok) console.warn('[RBC] Failed to send command_response for', msg.id); });
         });
         break;
       case 'command_response':
-        this._handleCommandResponse(msg.id, msg.result, msg.error);
         break;
       default:
         if (msg.type?.startsWith('tab_')) {
           const tabId = msg.type.split('_')[1];
-          this._sendToTab(tabId, msg.method, msg.params).catch(() => {});
+          this._sendToTab(tabId, msg.method, msg.params)
+            .then(result => this._send({ type: 'command_response', id: msg.id, result }))
+            .catch(err => this._send({ type: 'command_response', id: msg.id, error: { code: -32000, message: err.message } }));
         }
     }
   }
 
   _handleEvent(event, data) {
-    if (this._eventWaiters?.[event]) {
-      clearTimeout(this._eventWaiters[event].timeout);
-      this._eventWaiters[event].resolve(data);
-      delete this._eventWaiters[event];
-    }
+    // Events from gateway are currently informational only (no waiter system).
+    // Future: could add event subscription/waiting if needed.
   }
 
   disconnect() {
     this._stopHeartbeat();
-    this._clearPendingCommands();
     this.sessionId = null;
     this.connected = false;
     this._offscreen.disconnect().catch(() => {});
@@ -284,27 +319,18 @@ class RBCConnectionManager {
     this._broadcast({ type: 'status', status: 'disconnected', text: 'Disconnected' });
   }
 
-  _clearPendingCommands() {
-    for (const [id, waiter] of this._commandWaiters) {
-      clearTimeout(waiter.timeout);
-      if (!waiter.responded) {
-        waiter.responded = true;
-        try { waiter.sendResponse({ id, error: { code: -32000, message: 'Disconnected' } }); } catch {}
-      }
-    }
-    this._commandWaiters.clear();
-  }
-
-  _handleCommandResponse(id, result, error) {
-    const pending = this._commandWaiters.get(id);
-    if (!pending || pending.responded) return;
-    pending.responded = true;
-    clearTimeout(pending.timeout);
-    this._commandWaiters.delete(id);
-    try { pending.sendResponse({ id, result, error }); } catch {}
-  }
-
   _send(data) { return this._offscreen.send(data); }
+
+  async _sendToTab(tabId, method, params) {
+    const numericTabId = parseInt(tabId, 10);
+    if (isNaN(numericTabId)) throw new Error(`Invalid tabId: ${tabId}`);
+    return new Promise((resolve, reject) => {
+      chrome.tabs.sendMessage(numericTabId, { type: 'execute', command: method, params: params || {} }, (resp) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(resp);
+      });
+    });
+  }
 
   _updateStatus(status, text) {
     this.status = status; this.statusText = text;
@@ -332,46 +358,85 @@ class RBCConnectionManager {
   }
 
   _handleCommand(id, method, params, sendResponse) {
-    if (method === 'browser.navigate') {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]?.id) {
-          chrome.tabs.update(tabs[0].id, { url: params.url }, () => {
-            try { sendResponse({ id, result: { success: true } }); } catch {}
-          });
-        } else {
-          try { sendResponse({ id, error: { code: -32000, message: 'No active tab' } }); } catch {}
-        }
-      });
-      return;
-    }
+    // Helper: resolve target tab (supports optional params.tabId)
+    const resolveTab = (callback) => {
+      if (params?.tabId) { callback(params.tabId); }
+      else { chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => callback(tabs[0]?.id || null)); }
+    };
 
-    if (method === 'browser.snapshot') {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (!tabs[0]?.id) {
-          try { sendResponse({ id, error: { code: -32000, message: 'No active tab' } }); } catch {}
-          return;
-        }
-        chrome.tabs.sendMessage(tabs[0].id, { type: 'browser.snapshot', params }, (resp) => {
-          if (chrome.runtime.lastError) {
-            try { sendResponse({ id, error: { code: -32000, message: chrome.runtime.lastError.message } }); } catch {}
-          } else {
-            try { sendResponse({ id, result: resp }); } catch {}
-          }
+    const respondOk = (result) => { try { sendResponse({ id, result }); } catch {} };
+    const respondErr = (msg) => { try { sendResponse({ id, error: { code: -32000, message: msg } }); } catch {} };
+
+    // Helper: forward command to content script in target tab
+    const forwardToContent = () => {
+      resolveTab((tabId) => {
+        if (!tabId) { respondErr('No active tab'); return; }
+        let done = false;
+        const timeout = setTimeout(() => {
+          if (!done) { done = true; respondErr(`Timeout: ${method}`); }
+        }, 60000);
+
+        chrome.tabs.sendMessage(tabId, { type: 'execute', command: method, params: params || {} }, (resp) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timeout);
+          if (chrome.runtime.lastError) { respondErr(chrome.runtime.lastError.message); }
+          else if (resp?.error) { try { sendResponse({ id, error: resp.error }); } catch {} }
+          else { respondOk(resp); }
         });
       });
-      return;
-    }
+    };
 
-    let responded = false;
-    const timeout = setTimeout(() => {
-      if (!responded) {
-        responded = true;
-        this._commandWaiters.delete(id);
-        try { sendResponse({ id, error: { code: -32000, message: `Timeout: ${method}` } }); } catch {}
+    // ── Background-handled commands (chrome.tabs API required) ──
+    switch (method) {
+      case 'browser.navigate':
+        resolveTab((tabId) => {
+          if (!tabId) { respondErr('No active tab'); return; }
+          chrome.tabs.update(tabId, { url: params.url }, () => {
+            if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+            else respondOk({ success: true });
+          });
+        });
+        return;
+
+      case 'browser.newTab':
+        chrome.tabs.create({ url: params?.url || 'about:blank', active: params?.active !== false }, (tab) => {
+          if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+          else respondOk({ success: true, tabId: tab.id, url: tab.url || tab.pendingUrl });
+        });
+        return;
+
+      case 'browser.closeTab': {
+        const doClose = (tabId) => {
+          chrome.tabs.remove(tabId, () => {
+            if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+            else respondOk({ success: true });
+          });
+        };
+        if (params?.tabId) doClose(params.tabId);
+        else resolveTab((tabId) => { tabId ? doClose(tabId) : respondErr('No active tab'); });
+        return;
       }
-    }, 60000);
-    this._commandWaiters.set(id, { method, timeout, sendResponse, responded });
-    this._send({ type: 'command', id, method, params });
+
+      case 'browser.switchTab':
+        if (!params?.tabId) { respondErr('tabId required'); return; }
+        chrome.tabs.update(params.tabId, { active: true }, (tab) => {
+          if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+          else respondOk({ success: true, tabId: tab.id, url: tab.url });
+        });
+        return;
+
+      case 'browser.listTabs':
+        chrome.tabs.query({ currentWindow: true }, (tabs) => {
+          respondOk({ tabs: tabs.map(t => ({ tabId: t.id, url: t.url, title: t.title, active: t.active, index: t.index })) });
+        });
+        return;
+
+      default:
+        // All other commands → forward to content script
+        forwardToContent();
+        return;
+    }
   }
 }
 
@@ -379,31 +444,11 @@ class RBCConnectionManager {
 
 const conn = new RBCConnectionManager();
 
-// Restore state after Service Worker restart
+// Restore state after Service Worker restart.
+// loadConfig() already calls connect() if autoConnect is configured,
+// and offscreen.js handles the "already connected" case internally.
 async function restoreState() {
   await conn.loadConfig();
-  
-  // If autoConnect is enabled, check if we should reconnect
-  if (conn.config.autoConnect && conn.config.serverUrl && conn.config.token) {
-    console.log('[RBC] SW restarted, restoring connection...');
-    // Give offscreen time to initialize, then check its state
-    setTimeout(async () => {
-      try {
-        const isConnected = await conn._offscreen.status();
-        if (!isConnected) {
-          console.log('[RBC] Offscreen not connected, reconnecting...');
-          await conn.connect();
-        } else {
-          console.log('[RBC] Offscreen already connected, syncing state');
-          conn.connected = true;
-          conn._updateStatus('connected', 'Connected (restored)');
-        }
-      } catch (err) {
-        console.error('[RBC] Failed to restore state:', err);
-        await conn.connect();
-      }
-    }, 500);
-  }
 }
 
 restoreState();
@@ -415,8 +460,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'popup_connect':
       conn.config.autoConnect = true;
       conn.saveConfig({ autoConnect: true });
-      conn.connect();
-      sendResponse({ success: true });
+      conn.connect().then(() => {
+        sendResponse({ success: true });
+      }).catch((err) => {
+        sendResponse({ success: false, error: err.message });
+      });
+      return true; // Keep channel open for async sendResponse
       break;
 
     case 'popup_disconnect':
@@ -504,14 +553,17 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await chrome.tabs.get(activeInfo.tabId);
     if (tab?.url && tab.url.startsWith('http')) {
-      conn._broadcast({ url: tab.url, title: tab.title });
+      conn._send({
+        type: 'event', event: 'tab.activated',
+        data: { url: tab.url, title: tab.title, tabId: activeInfo.tabId }
+      });
     }
   } catch {}
 });
 
 chrome.webNavigation?.onCompleted?.addListener((details) => {
   if (details.frameId === 0 && details.url.startsWith('http')) {
-    conn._broadcast({ url: details.url });
+    conn._broadcast({ type: 'popup_update', url: details.url });
   }
 });
 
