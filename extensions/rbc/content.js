@@ -539,6 +539,121 @@
     },
 
     // Form operations
+    // Comprehensive autofill / pre-filled detection for form inputs.
+    // Returns detailed per-field analysis so callers can decide whether to fill or skip.
+    'form.detectFill': async ({ selectors }) => {
+      // Default: find all visible text/password/email/username/tel inputs
+      const inputSel = selectors || 'input[type=text], input[type=password], input[type=email], input[type="username"], input[type=tel], input:not([type])';
+      const inputs = Array.from(document.querySelectorAll(inputSel)).filter(el => isElementVisible(el));
+
+      const results = inputs.map(el => {
+        const id = el.id || '';
+        const name = el.name || '';
+        const inputType = (el.type || 'text').toLowerCase();
+        const label = (el.labels?.[0]?.textContent || '').trim() ||
+                      el.placeholder || el.getAttribute('aria-label') || '';
+
+        // ── Dimension 1: CSS pseudo-class :-webkit-autofill (most reliable Chrome indicator) ──
+        const cssMatch = typeof window.getComputedStyle === 'function' &&
+          (() => { try {
+            // :autofill works in modern Chrome (108+), also check legacy -webkit-autofill
+            const afterStyle = window.getComputedStyle(el, '::after');
+            const webkitStyle = window.getComputedStyle(el, ':-webkit-autofill');
+            return !!(
+              el.matches?.(':autofill') ||
+              el.matches?.(':-webkit-autofill') ||
+              webkitStyle?.backgroundColor !== afterStyle?.backgroundColor
+            );
+          } catch { return false; } })();
+
+        // ── Dimension 2: Actual .value content ──
+        let rawValue = el.value;
+        // Trigger events to reveal autofill values hidden by some browsers/frameworks
+        if (!rawValue) {
+          try {
+            el.focus();
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            rawValue = el.value;
+            el.blur();
+          } catch {}
+        }
+
+        const hasValue = typeof rawValue === 'string' && rawValue.length > 0;
+
+        // ── Dimension 3: HTML autocomplete attribute hints ──
+        const autocomplete = el.getAttribute('autocomplete') || '';
+        const hasAutocompleteHint = !!(autocomplete && autocomplete !== 'off' && autocomplete !== 'new-password');
+
+        // ── Dimension 4: Check React/Vue internal value (__valueFiber, _value, etc.) ──
+        let frameworkValue = null;
+        const keys = Object.keys(el);
+        for (const k of keys) {
+          if (k.startsWith('__reactFiber') || k.startsWith('__vue')) {
+            try { frameworkValue = String(el[k]); } catch {}
+            break;
+          }
+        }
+
+        // ── Dimension 5: defaultValue comparison (was it changed since page load?) ──
+        const defaultValue = el.defaultValue || '';
+        const valueChanged = hasValue && rawValue !== defaultValue;
+
+        // ── Dimension 6: Visual cue — background color shift typical of autofill highlight ──
+        let bgColorHint = false;
+        try {
+          const cs = window.getComputedStyle(el);
+          const bg = cs.backgroundColor;
+          // Chrome autofill typically uses a yellow-ish tint: rgb(250, 255, 189) or similar
+          if (bg && (bg.includes('250, 255') || bg.includes('255, 255, 189') || bg.includes('216, 227'))) {
+            bgColorHint = true;
+          }
+        } catch {}
+
+        // ── Composite judgment ──
+        // "Likely autofilled" = any strong signal (CSS match OR visual tint) + has value
+        // "Has meaningful value" = has non-empty value that differs from default
+        const likelyAutofilled = cssMatch || (hasValue && bgColorHint);
+        const filled = hasValue || (frameworkValue && frameworkValue.length > 0);
+        const meaningfulFilled = valueChanged || likelyAutofilled;
+
+        return {
+          selector: `#${id}` || `[name="${name}"]` || `[${inputType}]`,
+          id: id || undefined,
+          name: name || undefined,
+          type: inputType,
+          label: label || undefined,
+          value: rawValue || '',
+          hasValue: !!rawValue,
+          valueLength: (rawValue || '').length,
+          defaultValue: defaultValue || undefined,
+          valueChanged,
+          cssAutofillMatch: cssMatch,
+          autocompleteAttr: autocomplete || undefined,
+          hasAutocompleteHint,
+          bgColorHint,
+          frameworkValue: frameworkValue || undefined,
+          // Composite flags for quick decision-making:
+          likelyAutofilled,
+          filled,
+          meaningfulFilled,
+          recommendation: meaningfulFilled ? 'skip_and_submit' : (!filled ? 'needs_fill' : 'check_manually'),
+        };
+      });
+
+      // Aggregate summary
+      const summary = {
+        totalFields: results.length,
+        allMeaningfulFilled: results.length > 0 && results.every(r => r.meaningfulFilled),
+        allFilled: results.length > 0 && results.every(r => r.filled),
+        anyAutofillSignal: results.some(r => r.likelyAutofilled || r.cssAutofillMatch || r.bgColorHint),
+        fieldsNeedingFill: results.filter(r => !r.meaningfulFilled).map(r => ({ type: r.type, label: r.label, id: r.id })),
+        fieldsAlreadyFilled: results.filter(r => r.meaningfulFilled).map(r => ({ type: r.type, label: r.label, id: r.id, valuePreview: r.value.slice(0, 3) + '***' })),
+      };
+
+      return { results, summary };
+    },
+
     'form.fill': async ({ data }) => {
       // Delegate to page.fill which uses native setter for React/Vue compatibility
       return handlers['page.fill']({ data });
@@ -757,16 +872,8 @@
     return false;
   });
 
-  // Notify background when page loads
-  if (isContextValid()) {
-    try {
-      chrome.runtime.sendMessage({
-        type: 'content_page_loaded',
-        url: window.location.href,
-        title: document.title
-      });
-    } catch {}
-  }
+  // Note: page.loaded event is sent by background.js via chrome.tabs.onUpdated (includes tabId).
+  // No need to duplicate it here.
 
   console.log('[RBC] Content script ready');
 })();

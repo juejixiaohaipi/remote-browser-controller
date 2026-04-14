@@ -9,8 +9,8 @@
     "webNavigation",
     "downloads",
     "storage",
-    "offscreen",
     "debugger",
+    "scripting",
     "alarms"
   ],
   "host_permissions": [
