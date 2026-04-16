@@ -9,7 +9,7 @@
   // ── Keep SW alive via persistent port (MV3) ──
   let rbcPort = null;
   let reconnectCount = 0;
-  const MAX_RECONNECT = 10; // Max reconnection attempts to prevent infinite loops
+  const MAX_RECONNECT = 100; // Max reconnection attempts to prevent infinite loops
 
   // Detect orphaned content script: extension was reloaded/uninstalled,
   // chrome.runtime becomes undefined and recovery requires a page reload.
