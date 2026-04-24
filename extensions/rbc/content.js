@@ -4,6 +4,17 @@
 (function() {
   'use strict';
 
+  // Debug logging toggle — read from chrome.storage.local.rbcDebug.
+  // Set via devtools: chrome.storage.local.set({ rbcDebug: true })
+  let DEBUG = false;
+  try {
+    chrome.storage?.local?.get?.(['rbcDebug']).then(r => { DEBUG = !!r.rbcDebug; }).catch(() => {});
+    chrome.storage?.onChanged?.addListener?.((changes, area) => {
+      if (area === 'local' && changes.rbcDebug) DEBUG = !!changes.rbcDebug.newValue;
+    });
+  } catch {}
+  const dlog = (...args) => { if (DEBUG) console.log(...args); };
+
   console.log('[RBC] Content script loaded on', window.location.href);
 
   // ── Keep SW alive via persistent port (MV3) ──
@@ -87,7 +98,7 @@
   let lastDialog = null;
 
   function notifyDialog(dialogType, message) {
-    console.log('[RBC] Dialog intercepted:', dialogType, message);
+    dlog('[RBC] Dialog intercepted:', dialogType, message);
     lastDialog = { dialogType, message: String(message), timestamp: Date.now() };
     if (!isContextValid()) return;
     try {
@@ -117,17 +128,28 @@
   // Command handlers
 
   // ── Accessibility Snapshot (e# refs) ───────────────────────────────
+  // eRefMap stores WeakRefs so detached nodes (e.g., after SPA route swap)
+  // can be GC'd instead of leaking. URL is tracked too — if the page URL
+  // changes between snapshot and resolve, the old refs are invalidated.
   const snapshotState = {
-    eRefMap: new Map(),   // "e3" → HTMLElement
+    eRefMap: new Map(),       // "e3" → WeakRef<HTMLElement>
     nextId: 1,
+    snapshotUrl: '',
   };
 
   // Resolve a selector or e# ref to an HTMLElement
   function resolveElement(ref) {
     if (!ref) return null;
-    // e# snapshot ref
     if (/^e\d+$/.test(ref)) {
-      return snapshotState.eRefMap.get(ref) || null;
+      // Invalidate refs if URL changed since snapshot (SPA navigation)
+      if (snapshotState.snapshotUrl && snapshotState.snapshotUrl !== location.href) {
+        return null;
+      }
+      const weak = snapshotState.eRefMap.get(ref);
+      const el = weak?.deref?.() || null;
+      // Guard against detached nodes
+      if (el && !el.isConnected) return null;
+      return el;
     }
     return document.querySelector(ref);
   }
@@ -153,6 +175,7 @@
     // Reset refs on each snapshot
     snapshotState.eRefMap.clear();
     snapshotState.nextId = 1;
+    snapshotState.snapshotUrl = location.href;
 
     // Find all interactive/focusable elements
     const interactiveSelectors = [
@@ -177,7 +200,7 @@
           const rect = el.getBoundingClientRect();
 
           const eRef = 'e' + snapshotState.nextId++;
-          snapshotState.eRefMap.set(eRef, el);
+          snapshotState.eRefMap.set(eRef, new WeakRef(el));
 
           const implicitRole = (() => {
             const tag = el.tagName;
@@ -258,23 +281,33 @@
       const el = q(selector);
       el.focus();
 
+      // Use native value setter so React/Vue observe the change (their onChange
+      // listeners hook the prototype setter — direct .value= bypasses them).
+      // Uses Array.from to iterate by Unicode code points (CJK/emoji safe).
+      const chars = Array.from(String(text ?? ''));
+
       if (el.isContentEditable) {
-        // contenteditable elements don't have .value
         el.textContent = '';
-        for (const char of text) {
+        let acc = '';
+        for (const char of chars) {
           el.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
-          el.textContent += char;
+          acc += char;
+          el.textContent = acc;
           el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: char }));
           el.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
         }
       } else {
-        el.value = '';
-        for (const char of text) {
-          const charCode = char.charCodeAt(0);
-          el.dispatchEvent(new KeyboardEvent('keydown', { key: char, charCode, bubbles: true }));
-          el.value += char;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new KeyboardEvent('keyup', { key: char, charCode, bubbles: true }));
+        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        const setValue = (v) => { nativeSetter ? nativeSetter.call(el, v) : (el.value = v); };
+        setValue('');
+        let acc = '';
+        for (const char of chars) {
+          el.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+          acc += char;
+          setValue(acc);
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: char }));
+          el.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
         }
         el.dispatchEvent(new Event('change', { bubbles: true }));
       }
@@ -382,10 +415,14 @@
     'element.scroll': async ({ selector, x, y }) => {
       if (selector) {
         const el = q(selector);
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        // instant: handler returns as soon as scroll position is final,
+        // so callers can immediately read coordinates / take screenshots
+        el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'nearest' });
       } else if (x !== undefined || y !== undefined) {
-        window.scrollTo({ top: y || 0, left: x || 0, behavior: 'smooth' });
+        window.scrollTo({ top: y || 0, left: x || 0, behavior: 'instant' });
       }
+      // One rAF to let layout settle
+      await new Promise(r => requestAnimationFrame(() => r()));
       return { success: true };
     },
 
@@ -517,8 +554,11 @@
       return { storage: { ...localStorage } };
     },
 
+    // NOTE: Normally intercepted by background.js (CDP Runtime.evaluate) to
+    // bypass page CSP. This content-script fallback only runs if a caller sends
+    // the command directly to the tab (e.g. chrome.tabs.sendMessage from another
+    // extension component). It will fail silently on CSP-restricted pages.
     'page.evaluate': async ({ fn, args }) => {
-      // Runs in page context via injected script (can access page JS variables).
       return new Promise((resolve, reject) => {
         const callbackId = '_rbc_eval_' + Date.now() + '_' + Math.random().toString(36).slice(2);
         const handler = (event) => {
@@ -533,16 +573,18 @@
         script.textContent = `(function(){try{const fn=(${fn});const r=fn(${(args||[]).map(a=>JSON.stringify(a)).join(',')});window.postMessage({type:'${callbackId}',result:typeof r==='undefined'?null:JSON.parse(JSON.stringify(r))},'*')}catch(e){window.postMessage({type:'${callbackId}',error:e.message},'*')}})()`;
         document.documentElement.appendChild(script);
         script.remove();
-        // Timeout fallback
-        setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('page.evaluate timeout')); }, 10000);
+        setTimeout(() => {
+          window.removeEventListener('message', handler);
+          reject(new Error('page.evaluate timed out (CSP may have blocked script injection; prefer eval.js via background CDP)'));
+        }, 10000);
       });
     },
 
     // Form operations
-    // Comprehensive autofill / pre-filled detection for form inputs.
-    // Returns detailed per-field analysis so callers can decide whether to fill or skip.
+    // Passive autofill / pre-filled detection — NO focus/blur/dispatch side effects
+    // on the inspected inputs (previous version fired input+change on every field,
+    // stealing focus and triggering page validators).
     'form.detectFill': async ({ selectors }) => {
-      // Default: find all visible text/password/email/username/tel inputs
       const inputSel = selectors || 'input[type=text], input[type=password], input[type=email], input[type="username"], input[type=tel], input:not([type])';
       const inputs = Array.from(document.querySelectorAll(inputSel)).filter(el => isElementVisible(el));
 
@@ -553,88 +595,39 @@
         const label = (el.labels?.[0]?.textContent || '').trim() ||
                       el.placeholder || el.getAttribute('aria-label') || '';
 
-        // ── Dimension 1: CSS pseudo-class :-webkit-autofill (most reliable Chrome indicator) ──
-        const cssMatch = typeof window.getComputedStyle === 'function' &&
-          (() => { try {
-            // :autofill works in modern Chrome (108+), also check legacy -webkit-autofill
-            const afterStyle = window.getComputedStyle(el, '::after');
-            const webkitStyle = window.getComputedStyle(el, ':-webkit-autofill');
-            return !!(
-              el.matches?.(':autofill') ||
-              el.matches?.(':-webkit-autofill') ||
-              webkitStyle?.backgroundColor !== afterStyle?.backgroundColor
-            );
-          } catch { return false; } })();
+        // Autofill detection via the standard :autofill pseudo-class (Chrome 108+)
+        // plus legacy :-webkit-autofill. No brittle background-color string matching.
+        let cssAutofillMatch = false;
+        try {
+          cssAutofillMatch = !!(el.matches?.(':autofill') || el.matches?.(':-webkit-autofill'));
+        } catch {}
 
-        // ── Dimension 2: Actual .value content ──
-        let rawValue = el.value;
-        // Trigger events to reveal autofill values hidden by some browsers/frameworks
-        if (!rawValue) {
-          try {
-            el.focus();
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            rawValue = el.value;
-            el.blur();
-          } catch {}
-        }
-
+        const rawValue = el.value;
         const hasValue = typeof rawValue === 'string' && rawValue.length > 0;
 
-        // ── Dimension 3: HTML autocomplete attribute hints ──
         const autocomplete = el.getAttribute('autocomplete') || '';
         const hasAutocompleteHint = !!(autocomplete && autocomplete !== 'off' && autocomplete !== 'new-password');
 
-        // ── Dimension 4: Check React/Vue internal value (__valueFiber, _value, etc.) ──
-        let frameworkValue = null;
-        const keys = Object.keys(el);
-        for (const k of keys) {
-          if (k.startsWith('__reactFiber') || k.startsWith('__vue')) {
-            try { frameworkValue = String(el[k]); } catch {}
-            break;
-          }
-        }
-
-        // ── Dimension 5: defaultValue comparison (was it changed since page load?) ──
         const defaultValue = el.defaultValue || '';
         const valueChanged = hasValue && rawValue !== defaultValue;
 
-        // ── Dimension 6: Visual cue — background color shift typical of autofill highlight ──
-        let bgColorHint = false;
-        try {
-          const cs = window.getComputedStyle(el);
-          const bg = cs.backgroundColor;
-          // Chrome autofill typically uses a yellow-ish tint: rgb(250, 255, 189) or similar
-          if (bg && (bg.includes('250, 255') || bg.includes('255, 255, 189') || bg.includes('216, 227'))) {
-            bgColorHint = true;
-          }
-        } catch {}
-
-        // ── Composite judgment ──
-        // "Likely autofilled" = any strong signal (CSS match OR visual tint) + has value
-        // "Has meaningful value" = has non-empty value that differs from default
-        const likelyAutofilled = cssMatch || (hasValue && bgColorHint);
-        const filled = hasValue || (frameworkValue && frameworkValue.length > 0);
-        const meaningfulFilled = valueChanged || likelyAutofilled;
+        const filled = hasValue;
+        const meaningfulFilled = valueChanged || cssAutofillMatch;
 
         return {
-          selector: `#${id}` || `[name="${name}"]` || `[${inputType}]`,
+          selector: id ? `#${id}` : (name ? `[name="${name}"]` : `[${inputType}]`),
           id: id || undefined,
           name: name || undefined,
           type: inputType,
           label: label || undefined,
           value: rawValue || '',
-          hasValue: !!rawValue,
+          hasValue,
           valueLength: (rawValue || '').length,
           defaultValue: defaultValue || undefined,
           valueChanged,
-          cssAutofillMatch: cssMatch,
+          cssAutofillMatch,
           autocompleteAttr: autocomplete || undefined,
           hasAutocompleteHint,
-          bgColorHint,
-          frameworkValue: frameworkValue || undefined,
-          // Composite flags for quick decision-making:
-          likelyAutofilled,
           filled,
           meaningfulFilled,
           recommendation: meaningfulFilled ? 'skip_and_submit' : (!filled ? 'needs_fill' : 'check_manually'),
@@ -646,7 +639,7 @@
         totalFields: results.length,
         allMeaningfulFilled: results.length > 0 && results.every(r => r.meaningfulFilled),
         allFilled: results.length > 0 && results.every(r => r.filled),
-        anyAutofillSignal: results.some(r => r.likelyAutofilled || r.cssAutofillMatch || r.bgColorHint),
+        anyAutofillSignal: results.some(r => r.cssAutofillMatch),
         fieldsNeedingFill: results.filter(r => !r.meaningfulFilled).map(r => ({ type: r.type, label: r.label, id: r.id })),
         fieldsAlreadyFilled: results.filter(r => r.meaningfulFilled).map(r => ({ type: r.type, label: r.label, id: r.id, valuePreview: r.value.slice(0, 3) + '***' })),
       };
@@ -695,13 +688,34 @@
 
     // Wait operations
     'wait.forSelector': async ({ selector, timeout = 30000 }) => {
-      const start = Date.now();
-      while (Date.now() - start < timeout) {
-        const el = resolveElement(selector);
-        if (el) return { success: true, found: true };
-        await new Promise(r => setTimeout(r, 100));
-      }
-      throw new Error(`Timeout waiting for selector: ${selector}`);
+      // Fast path
+      const existing = resolveElement(selector);
+      if (existing) return { success: true, found: true };
+
+      // MutationObserver-based wait — hits as soon as the node is inserted,
+      // with no 100ms polling latency and negligible CPU overhead.
+      return new Promise((resolve, reject) => {
+        let done = false;
+        const observer = new MutationObserver(() => {
+          if (done) return;
+          const el = resolveElement(selector);
+          if (el) {
+            done = true;
+            observer.disconnect();
+            clearTimeout(timer);
+            resolve({ success: true, found: true });
+          }
+        });
+        observer.observe(document.documentElement, {
+          childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'id', 'style', 'hidden'],
+        });
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true;
+          observer.disconnect();
+          reject(new Error(`Timeout waiting for selector: ${selector}`));
+        }, timeout);
+      });
     },
 
     'wait.forNavigation': async ({ timeout = 30000 }) => {
@@ -779,26 +793,9 @@
       throw new Error('frame.switch is not supported from content script — use background scripting API with frameIds');
     },
 
-    // JavaScript evaluation
-    'eval.js': async ({ script }) => {
-      // Runs in page context via injected script (can access page JS variables).
-      return new Promise((resolve, reject) => {
-        const callbackId = '_rbc_eval_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-        const handler = (event) => {
-          if (event.data?.type === callbackId) {
-            window.removeEventListener('message', handler);
-            if (event.data.error) reject(new Error(`JS Error: ${event.data.error}`));
-            else resolve({ result: event.data.result, success: true });
-          }
-        };
-        window.addEventListener('message', handler);
-        const el = document.createElement('script');
-        el.textContent = `(function(){try{const r=(function(){${script}})();window.postMessage({type:'${callbackId}',result:typeof r==='undefined'?null:JSON.parse(JSON.stringify(r))},'*')}catch(e){window.postMessage({type:'${callbackId}',error:e.message},'*')}})()`;
-        document.documentElement.appendChild(el);
-        el.remove();
-        setTimeout(() => { window.removeEventListener('message', handler); reject(new Error('eval.js timeout')); }, 10000);
-      });
-    },
+    // eval.js is always handled by background.js via CDP (Runtime.evaluate).
+    // Content-script path removed: it was unreachable and would fail under
+    // strict CSP anyway.
 
     // File operations
     'file.download': async ({ url, filename }) => {
@@ -846,7 +843,7 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'execute') {
       const { command, params } = message;
-      console.log('[RBC] Execute command:', command, params);
+      dlog('[RBC] Execute command:', command, params);
 
       const handler = handlers[command];
       if (!handler) {

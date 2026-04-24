@@ -27,13 +27,13 @@ const el = {
 // ─── Config ───────────────────────────────────────────────────────────────
 
 async function loadConfig() {
-  const r = await chrome.storage.local.get(['serverUrl', 'token', 'deviceId', 'autoConnect', 'connectionStatus', 'statusText']);
+  const r = await chrome.storage.local.get(['serverUrl', 'token', 'deviceId', 'autoConnect']);
   el.serverUrl.value = r.serverUrl || '';
   el.token.value = r.token || '';
   el.deviceId.value = r.deviceId || '';
   el.autoConnect.checked = r.autoConnect || false;
-  if (r.connectionStatus) updateStatus(r.connectionStatus, r.statusText || '');
   if (r.token) el.sessToken.textContent = r.token.slice(0, 8) + '...';
+  // Current status is fetched from background via popup_status (see init below)
 }
 
 async function saveConfig() {
@@ -99,16 +99,19 @@ async function refreshTabInfo() {
 async function doScreenshot() {
   addLog('Taking screenshot...');
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab) {
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-      // Download
-      const a = document.createElement('a');
-      a.href = dataUrl;
-      a.download = `screenshot-${Date.now()}.png`;
-      a.click();
-      addLog('Screenshot saved');
-    }
+    // Use the same code path as server-triggered screenshots: ask background
+    // to capture, which keeps a single source of truth for the capture logic.
+    const dataUrl = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'capture_visible_tab' }, (resp) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resp ? resolve(resp) : reject(new Error('No active tab'));
+      });
+    });
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = `screenshot-${Date.now()}.png`;
+    a.click();
+    addLog('Screenshot saved');
   } catch (e) {
     addLog('Screenshot failed: ' + e.message, 'error');
   }
@@ -141,7 +144,12 @@ function addLog(msg, level = 'info') {
   const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   const entry = document.createElement('div');
   entry.className = `log-entry ${level}`;
-  entry.innerHTML = `<span class="time">${time}</span>${msg}`;
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'time';
+  timeSpan.textContent = time;
+  entry.appendChild(timeSpan);
+  // textContent avoids HTML injection from server/page-provided error messages
+  entry.appendChild(document.createTextNode(String(msg)));
   el.logContainer.insertBefore(entry, el.logContainer.firstChild);
   while (el.logContainer.children.length > 50) el.logContainer.removeChild(el.logContainer.lastChild);
 }

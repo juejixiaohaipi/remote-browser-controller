@@ -4,7 +4,6 @@
   "version": "1.0.0",
   "description": "远程浏览器控制插件 - 允许通过WebSocket远程控制此浏览器",
   "permissions": [
-    "activeTab",
     "tabs",
     "webNavigation",
     "downloads",
