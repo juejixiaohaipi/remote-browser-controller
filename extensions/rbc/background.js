@@ -23,7 +23,7 @@ let reconnectAttempts = 0;
 let reconnectTimer = null;
 let pingTimer = null;
 
-/** @type {{ serverUrl: string, token: string, deviceId: string, deviceName: string }} */
+/** @type {{ serverUrl: string, token: string, deviceId: string, deviceCode: string }} */
 let savedConfig = null;
 
 // ============= Connection Manager =============
@@ -32,7 +32,7 @@ class RBCConnectionManager {
   constructor() {
     this.sessionId = null;
     this.connected = false;
-    this.config = { serverUrl: '', token: '', deviceName: '', deviceId: '', autoConnect: false };
+    this.config = { serverUrl: '', token: '', deviceId: '', deviceCode: '', autoConnect: false };
     this.status = 'disconnected';
     this.statusText = 'Not connected';
     this._listeners = new Map();
@@ -55,14 +55,16 @@ class RBCConnectionManager {
   // ---- Config ----
 
   async loadConfig() {
-    const result = await chrome.storage.local.get(['serverUrl', 'token', 'deviceName', 'autoConnect', 'deviceId']);
-    let deviceId = result.deviceId;
-    if (!deviceId) { deviceId = crypto.randomUUID(); await chrome.storage.local.set({ deviceId }); }
+    const result = await chrome.storage.local.get(['serverUrl', 'token', 'deviceId', 'deviceCode', 'autoConnect']);
+    // deviceId: user-input UUID for identification
+    // deviceCode: auto-generated UUID for this browser instance
+    let deviceCode = result.deviceCode;
+    if (!deviceCode) { deviceCode = crypto.randomUUID(); await chrome.storage.local.set({ deviceCode }); }
     this.config = {
       serverUrl: result.serverUrl || '',
       token: result.token || '',
-      deviceName: result.deviceName || '',
-      deviceId,
+      deviceId: result.deviceId || '',
+      deviceCode,
       autoConnect: result.autoConnect || false
     };
 
@@ -105,19 +107,20 @@ class RBCConnectionManager {
     await chrome.storage.local.set({
       serverUrl: this.config.serverUrl,
       token: this.config.token,
-      deviceName: this.config.deviceName,
       deviceId: this.config.deviceId,
+      deviceCode: this.config.deviceCode,
       autoConnect: this.config.autoConnect
     });
   }
 
-  getDeviceId() { return this.config.deviceId || chrome.runtime.id; }
+  getDeviceId() { return this.config.deviceId; }
+  getDeviceCode() { return this.config.deviceCode; }
 
   // ---- Connect / Disconnect ----
 
   connect() {
     if (!this.config.serverUrl || !this.config.token) {
-      this._updateStatus('error', 'Server or token not configured');
+      this._updateStatus('error', 'Server URL and token are required');
       return;
     }
     this._updateStatus('connecting', 'Connecting...');
@@ -125,10 +128,10 @@ class RBCConnectionManager {
       serverUrl: this.config.serverUrl,
       token: this.config.token,
       deviceId: this.getDeviceId(),
-      deviceName: this.config.deviceName || `Chrome-${this.getDeviceId().slice(0, 8)}`
+      deviceCode: this.getDeviceCode()
     };
     reconnectAttempts = 0;
-    this._connectWs(savedConfig.serverUrl, savedConfig.token, savedConfig.deviceId, savedConfig.deviceName);
+    this._connectWs(savedConfig.serverUrl, savedConfig.token, savedConfig.deviceId, savedConfig.deviceCode);
     this._startKeepAliveAlarm();
   }
 
@@ -148,7 +151,7 @@ class RBCConnectionManager {
 
   // ---- Core WebSocket Management (lives here, not in offscreen!) ----
 
-  _connectWs(serverUrl, token, deviceId, deviceName) {
+  _connectWs(serverUrl, token, deviceId, deviceCode) {
     // Close existing if any
     if (ws) { try { ws.close(); } catch {} ws = null; }
 
@@ -158,7 +161,11 @@ class RBCConnectionManager {
     console.log(`[RBC] Connecting to ${serverUrl} ...`);
     let wss;
     try {
-      wss = new WebSocket(serverUrl);
+      // Convert http/https to ws/wss for WebSocket connection
+      const wsUrl = serverUrl
+        .replace(/^http:\/\//i, 'ws://')
+        .replace(/^https:\/\//i, 'wss://');
+      wss = new WebSocket(wsUrl);
     } catch (err) {
       console.error('[RBC] WebSocket constructor error:', err.message);
       this._emit('error', { message: err.message });
@@ -179,8 +186,8 @@ class RBCConnectionManager {
         wss.send(JSON.stringify({
           type: 'auth',
           token,
-          deviceId,
-          deviceName: deviceName || `Chrome-${deviceId?.slice(0, 8)}`,
+          deviceId,      // user-input UUID (maps to device_code in DB)
+          deviceCode,    // auto-generated UUID (for reference)
           browserType: 'chrome',
           tags: ['chrome-extension', 'sw-direct']
         }));
@@ -336,7 +343,7 @@ class RBCConnectionManager {
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       if (savedConfig) {
-        this._connectWs(savedConfig.serverUrl, savedConfig.token, savedConfig.deviceId, savedConfig.deviceName);
+        this._connectWs(savedConfig.serverUrl, savedConfig.token, savedConfig.deviceId, savedConfig.deviceCode);
       }
     }, delay);
   }
@@ -736,7 +743,7 @@ class RBCConnectionManager {
       type: 'auth',
       token: savedConfig.token,
       deviceId: savedConfig.deviceId,
-      deviceName: savedConfig.deviceName,
+      deviceCode: savedConfig.deviceCode,
       browserType: 'chrome',
       tags: ['chrome-extension', 'sw-direct']
     }));
@@ -801,8 +808,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         status: conn.status,
         config: conn.config,
         sessionId: conn.sessionId,
-        deviceName: conn.config?.deviceName || '',
         deviceId: conn.getDeviceId(),
+        deviceCode: conn.getDeviceCode(),
       });
       break;
 

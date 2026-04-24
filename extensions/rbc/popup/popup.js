@@ -12,25 +12,24 @@ const el = {
   qsRefresh:    $('qsRefresh'),
   serverUrl:    $('serverUrl'),
   token:        $('token'),
-  deviceName:   $('deviceName'),
+  deviceId:     $('deviceId'),
   autoConnect:  $('autoConnect'),
-  connectBtn:  $('connectBtn'),
+  connectBtn:   $('connectBtn'),
   disconnectBtn: $('disconnectBtn'),
   sessionInfo:  $('sessionInfo'),
   sessId:       $('sessId'),
-  sessDevice:   $('sessDevice'),
   sessDeviceId: $('sessDeviceId'),
-  sessToken:   $('sessToken'),
+  sessToken:    $('sessToken'),
   logContainer: $('logContainer'),
 };
 
 // ─── Config ───────────────────────────────────────────────────────────────
 
 async function loadConfig() {
-  const r = await chrome.storage.local.get(['serverUrl', 'token', 'deviceName', 'autoConnect', 'connectionStatus', 'statusText']);
+  const r = await chrome.storage.local.get(['serverUrl', 'token', 'deviceId', 'autoConnect', 'connectionStatus', 'statusText']);
   el.serverUrl.value = r.serverUrl || '';
   el.token.value = r.token || '';
-  el.deviceName.value = r.deviceName || '';
+  el.deviceId.value = r.deviceId || '';
   el.autoConnect.checked = r.autoConnect || false;
   if (r.connectionStatus) updateStatus(r.connectionStatus, r.statusText || '');
   if (r.token) el.sessToken.textContent = r.token.slice(0, 8) + '...';
@@ -40,7 +39,7 @@ async function saveConfig() {
   const config = {
     serverUrl: el.serverUrl.value,
     token: el.token.value,
-    deviceName: el.deviceName.value,
+    deviceId: el.deviceId.value,
     autoConnect: el.autoConnect.checked,
   };
   await chrome.storage.local.set(config);
@@ -201,7 +200,7 @@ function disconnect() {
 
 chrome.runtime.onMessage.addListener((msg) => {
   // Background broadcasts multiple message types — handle all of them
-  const statusTypes = ['popup_update', 'status', 'connected', 'disconnected', 'reconnecting', 'error'];
+  const statusTypes = ['popup_update', 'popup_status', 'status', 'connected', 'disconnected', 'reconnecting', 'error'];
   if (!statusTypes.includes(msg.type)) return;
 
   if (msg.status) updateStatus(msg.status, msg.text || msg.statusText);
@@ -209,8 +208,8 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'disconnected') { updateStatus('disconnected', 'Disconnected'); addLog(msg.text || 'Disconnected'); }
   if (msg.type === 'reconnecting') { updateStatus('reconnecting', `Reconnecting... (${msg.attempt})`); addLog(`重连中... (${msg.attempt})`, 'warn'); }
   if (msg.sessionId) el.sessId.textContent = msg.sessionId;
-  if (msg.deviceName) el.sessDevice.textContent = msg.deviceName;
-  if (msg.deviceId) el.sessDeviceId.textContent = msg.deviceId;
+  if (msg.config?.deviceId) el.sessDeviceId.textContent = msg.config.deviceId.slice(0, 8);
+  if (msg.config?.deviceCode) el.sessDeviceCode.textContent = msg.config.deviceCode.slice(0, 8);
   if (msg.text || msg.statusText) addLog(msg.text || msg.statusText);
   if (msg.url) { el.currentUrl.textContent = msg.url.slice(0, 40); el.currentUrl.title = msg.url; }
 });
@@ -224,7 +223,7 @@ el.qsNewTab.addEventListener('click', doNewTab);
 el.qsRefresh.addEventListener('click', doRefreshStatus);
 el.serverUrl.addEventListener('change', saveConfig);
 el.token.addEventListener('change', saveConfig);
-el.deviceName.addEventListener('change', saveConfig);
+el.deviceId.addEventListener('change', saveConfig);
 el.autoConnect.addEventListener('change', saveConfig);
 
 loadConfig().then(async () => {
@@ -233,8 +232,8 @@ loadConfig().then(async () => {
   chrome.runtime.sendMessage({ type: 'popup_status' }, (status) => {
     if (status) {
       if (status.sessionId) el.sessId.textContent = status.sessionId;
-      if (status.deviceName) el.sessDevice.textContent = status.deviceName;
-      if (status.deviceId) el.sessDeviceId.textContent = status.deviceId;
+      if (status.config?.deviceId) el.sessDeviceId.textContent = status.config.deviceId.slice(0, 8);
+      if (status.config?.deviceCode) el.sessDeviceCode.textContent = status.config.deviceCode.slice(0, 8);
       if (status.status) {
         updateStatus(status.status, status.statusText);
         addLog(`Status: ${status.statusText || status.status}`);
