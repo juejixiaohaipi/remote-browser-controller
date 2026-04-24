@@ -17,9 +17,10 @@ const el = {
   connectBtn:   $('connectBtn'),
   disconnectBtn: $('disconnectBtn'),
   sessionInfo:  $('sessionInfo'),
-  sessId:       $('sessId'),
-  sessDeviceId: $('sessDeviceId'),
-  sessToken:    $('sessToken'),
+  sessId:         $('sessId'),
+  sessDeviceId:   $('sessDeviceId'),
+  sessDeviceCode: $('sessDeviceCode'),
+  sessToken:      $('sessToken'),
   logContainer: $('logContainer'),
 };
 
