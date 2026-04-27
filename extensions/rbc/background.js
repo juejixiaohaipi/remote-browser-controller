@@ -726,6 +726,119 @@ class RBCConnectionManager {
         return;
       }
 
+      // page.ax_tree: full accessibility tree via CDP. Returns interactive
+      // nodes with computed role / name (from the browser's a11y engine —
+      // more accurate than DOM heuristics) plus a CSS selector hint built
+      // from the backend DOM node's attributes.
+      case 'page.ax_tree': {
+        resolveTab((tabId) => {
+          if (!tabId) { respondErr('No active tab'); return; }
+          const numericTabId = parseInt(tabId, 10);
+          const sendCDP = (cmd, args) => new Promise((resolve, reject) => {
+            chrome.debugger.sendCommand({ tabId: numericTabId }, cmd, args || {}, (r) => {
+              if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+              else resolve(r);
+            });
+          });
+          const INTERACTIVE = new Set([
+            'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
+            'searchbox', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
+            'tab', 'switch', 'slider', 'spinbutton', 'option',
+          ]);
+          const buildSelector = (node) => {
+            if (!node || !node.attributes) return null;
+            const attrs = {};
+            for (let i = 0; i < node.attributes.length; i += 2) {
+              attrs[node.attributes[i]] = node.attributes[i + 1];
+            }
+            const tag = (node.localName || '').toLowerCase();
+            // id, data-testid, name, aria-label — in priority order
+            if (attrs.id && /^[a-zA-Z_][\w-]*$/.test(attrs.id)) return '#' + attrs.id;
+            if (attrs.id) return `[id="${attrs.id.replace(/"/g, '\\"')}"]`;
+            if (attrs['data-testid']) return `[data-testid="${attrs['data-testid'].replace(/"/g, '\\"')}"]`;
+            if (attrs.name && tag) return `${tag}[name="${attrs.name.replace(/"/g, '\\"')}"]`;
+            if (attrs['aria-label']) return `[aria-label="${attrs['aria-label'].replace(/"/g, '\\"')}"]`;
+            // type-based hints for inputs
+            if (tag === 'input' && attrs.type) return `input[type="${attrs.type}"]`;
+            return null;
+          };
+          const getValue = (v) => v && typeof v === 'object' && 'value' in v ? v.value : v;
+          const propMap = (props) => {
+            const m = {};
+            for (const p of props || []) m[p.name] = getValue(p.value);
+            return m;
+          };
+          const doFetch = async () => {
+            try {
+              await sendCDP('Accessibility.enable', {}).catch(() => {});
+              await sendCDP('DOM.enable', {}).catch(() => {});
+              const ax = await sendCDP('Accessibility.getFullAXTree', {});
+              const nodes = ax?.nodes || [];
+
+              // First pass: filter interactive non-ignored nodes.
+              const candidates = [];
+              for (const n of nodes) {
+                if (n.ignored) continue;
+                const role = getValue(n.role);
+                if (!INTERACTIVE.has(role)) continue;
+                candidates.push(n);
+              }
+
+              // Second pass: resolve DOM details for each — done in parallel
+              // but capped to avoid blasting the protocol.
+              const out = [];
+              const CONCURRENCY = 8;
+              for (let i = 0; i < candidates.length; i += CONCURRENCY) {
+                const slice = candidates.slice(i, i + CONCURRENCY);
+                const resolved = await Promise.all(slice.map(async (n) => {
+                  const role = getValue(n.role);
+                  const name = (getValue(n.name) || '').toString().slice(0, 120);
+                  const value = (getValue(n.value) || '').toString().slice(0, 80);
+                  const desc = (getValue(n.description) || '').toString().slice(0, 80);
+                  const props = propMap(n.properties);
+                  let selector = null, tag = null;
+                  if (n.backendDOMNodeId) {
+                    try {
+                      const r = await sendCDP('DOM.describeNode', { backendNodeId: n.backendDOMNodeId });
+                      tag = (r?.node?.localName || '').toLowerCase();
+                      selector = buildSelector(r?.node);
+                    } catch {}
+                  }
+                  return {
+                    nodeId: n.nodeId,
+                    backendNodeId: n.backendDOMNodeId,
+                    role,
+                    name,
+                    value,
+                    description: desc,
+                    tag,
+                    selector,
+                    disabled: !!props.disabled,
+                    focused: !!props.focused,
+                    checked: props.checked,
+                    expanded: props.expanded,
+                  };
+                }));
+                out.push(...resolved);
+              }
+              respondOk({ count: out.length, nodes: out });
+            } catch (e) {
+              respondErr(e.message);
+            } finally {
+              try { chrome.debugger.detach({ tabId: numericTabId }); } catch {}
+            }
+          };
+          chrome.debugger.attach({ tabId: numericTabId }, '1.3', () => {
+            if (chrome.runtime.lastError) {
+              if (chrome.runtime.lastError.message.includes('already attached')) { doFetch(); return; }
+              respondErr(chrome.runtime.lastError.message); return;
+            }
+            doFetch();
+          });
+        });
+        return;
+      }
+
       // element.trusted_click: synthesize a real user-gesture click via CDP.
       // Required to trigger Chrome's password-manager autofill (which gates on
       // event.isTrusted). Looks up the element's center via Runtime.evaluate,
