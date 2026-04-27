@@ -726,6 +726,58 @@ class RBCConnectionManager {
         return;
       }
 
+      // element.trusted_click: synthesize a real user-gesture click via CDP.
+      // Required to trigger Chrome's password-manager autofill (which gates on
+      // event.isTrusted). Looks up the element's center via Runtime.evaluate,
+      // then dispatches mousePressed + mouseReleased through Input.dispatchMouseEvent.
+      case 'element.trusted_click': {
+        const selector = params?.selector;
+        if (!selector) { respondErr('selector required'); return; }
+        resolveTab((tabId) => {
+          if (!tabId) { respondErr('No active tab'); return; }
+          const numericTabId = parseInt(tabId, 10);
+          const sendCDP = (cmd, args) => new Promise((resolve, reject) => {
+            chrome.debugger.sendCommand({ tabId: numericTabId }, cmd, args, (r) => {
+              if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+              else resolve(r);
+            });
+          });
+          const doClick = async () => {
+            try {
+              // 1) Resolve coordinates of the element (scroll into view first).
+              const expr = `(() => {
+                const el = document.querySelector(${JSON.stringify(selector)});
+                if (!el) return { found: false };
+                el.scrollIntoView({ block: 'center', inline: 'center' });
+                const r = el.getBoundingClientRect();
+                return { found: true, x: r.left + r.width / 2, y: r.top + r.height / 2 };
+              })()`;
+              const evalRes = await sendCDP('Runtime.evaluate', { expression: expr, returnByValue: true });
+              const v = evalRes?.result?.value;
+              if (!v?.found) { respondErr(`Element not found: ${selector}`); return; }
+              const { x, y } = v;
+              // 2) Trusted click — Chrome treats CDP-dispatched mouse events as user gestures.
+              await sendCDP('Input.dispatchMouseEvent', { type: 'mouseMoved',    x, y });
+              await sendCDP('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1 });
+              await sendCDP('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+              respondOk({ success: true, x, y });
+            } catch (e) {
+              respondErr(e.message);
+            } finally {
+              try { chrome.debugger.detach({ tabId: numericTabId }); } catch {}
+            }
+          };
+          chrome.debugger.attach({ tabId: numericTabId }, '1.3', () => {
+            if (chrome.runtime.lastError) {
+              if (chrome.runtime.lastError.message.includes('already attached')) { doClick(); return; }
+              respondErr(chrome.runtime.lastError.message); return;
+            }
+            doClick();
+          });
+        });
+        return;
+      }
+
       default:
         // All other commands → forward to content script (DOM operations)
         forwardToContent();
