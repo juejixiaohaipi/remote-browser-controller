@@ -785,36 +785,66 @@ class RBCConnectionManager {
         return;
       }
 
-      // eval.js / page.evaluate: run via chrome.debugger CDP to bypass strict CSP
-      // pages (script-src 'none' etc.) where <script> injection from content.js fails.
+      // eval.js / page.evaluate: run via chrome.debugger CDP first (bypasses
+      // strict CSP), fall back to content-script <script>-tag injection when
+      // the debugger isn't accessible (DevTools open / another extension
+      // holds it / restricted URL). The content-script fallback works on
+      // most sites; it WILL silently fail on CSP-strict pages, and that's
+      // surfaced via a clearer error.
       case 'eval.js':
       case 'page.evaluate': {
         const expression = method === 'page.evaluate'
           ? `(${params?.fn})(${(params?.args || []).map(a => JSON.stringify(a)).join(',')})`
           : (params?.script || '');
+        // The content.js handler signature for page.evaluate is { fn, args };
+        // for eval.js it's { script }. We forward the original `params` shape
+        // so each side gets what it expects.
         resolveTab((tabId) => {
           if (!tabId) { respondErr('No active tab'); return; }
           dlog('[RBC]', method, 'via debugger on tab', tabId);
           const numericTabId = parseInt(tabId, 10);
+          let detached = false;
+          const detachOnce = () => {
+            if (detached) return;
+            detached = true;
+            try { chrome.debugger.detach({ tabId: numericTabId }); } catch {}
+          };
+          const fallbackToContent = (cdpErrMsg) => {
+            dlog('[RBC]', method, 'CDP unavailable (' + cdpErrMsg + ') — falling back to content-script');
+            // Don't pass cdpErrMsg to forwardToContent — it uses the same
+            // method/params as set on the outer scope. Just delegate.
+            forwardToContent();
+          };
           const doEval = () => {
             chrome.debugger.sendCommand({ tabId: numericTabId }, 'Runtime.evaluate',
               { expression, returnByValue: true, awaitPromise: true },
               (result) => {
-                try { chrome.debugger.detach({ tabId: numericTabId }); } catch {}
-                if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
-                else if (result?.exceptionDetails) {
+                detachOnce();
+                if (chrome.runtime.lastError) {
+                  // sendCommand failure (rare after attach succeeds) — still try fallback
+                  fallbackToContent(chrome.runtime.lastError.message);
+                  return;
+                }
+                if (result?.exceptionDetails) {
                   const msg = result.exceptionDetails.exception?.description
                     || result.exceptionDetails.text
                     || JSON.stringify(result.exceptionDetails).slice(0, 200);
+                  // Real JS exception in user code — don't mask it with a fallback.
                   respondErr(msg);
+                  return;
                 }
-                else respondOk({ result: result?.result?.value ?? null });
+                respondOk({ result: result?.result?.value ?? null });
               });
           };
           chrome.debugger.attach({ tabId: numericTabId }, '1.3', () => {
             if (chrome.runtime.lastError) {
-              if (chrome.runtime.lastError.message.includes('already attached')) { doEval(); return; }
-              respondErr(chrome.runtime.lastError.message); return;
+              const msg = chrome.runtime.lastError.message || '';
+              if (msg.includes('already attached')) { doEval(); return; }
+              // Common attach-fail signatures: "Cannot access a chrome-extension://...",
+              // "Another debugger is already attached", "Cannot attach to ...".
+              // For all of these, gracefully degrade to content-script eval.
+              fallbackToContent(msg);
+              return;
             }
             doEval();
           });
