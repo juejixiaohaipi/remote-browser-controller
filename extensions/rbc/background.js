@@ -712,16 +712,70 @@ class RBCConnectionManager {
         return;
       }
 
-      // Screenshot (via chrome.tabs API)
-      case 'page.screenshot':
+      // Screenshot:
+      //   • { fullPage: false } (default) → chrome.tabs.captureVisibleTab,
+      //     just the visible viewport. Fast, ~1 round-trip, no debugger.
+      //   • { fullPage: true } → CDP Page.captureScreenshot with
+      //     captureBeyondViewport=true: single-shot full page, no scrolling
+      //     hacks, no stitching. If chrome.debugger is blocked (DevTools
+      //     open, contention), fall back to content-script scroll-and-stitch.
+      //   • Optional { format: 'png' | 'jpeg', quality: 0–100 } — jpeg with
+      //     a quality of 70–80 is a fraction of png size for the same
+      //     visual fidelity, useful for long full-page captures.
+      case 'page.screenshot': {
+        const fullPage = !!params?.fullPage;
+        const format = (params?.format === 'jpeg') ? 'jpeg' : 'png';
+        const quality = (typeof params?.quality === 'number' && params.quality > 0 && params.quality <= 100)
+          ? params.quality : (format === 'jpeg' ? 80 : undefined);
         resolveTab((tabId) => {
           if (!tabId) { respondErr('No active tab'); return; }
-          chrome.tabs.captureVisibleTab(null, { format: 'png' }, (dataUrl) => {
-            if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
-            else respondOk({ dataUrl, format: 'png' });
+          if (!fullPage) {
+            chrome.tabs.captureVisibleTab(null, { format }, (dataUrl) => {
+              if (chrome.runtime.lastError) respondErr(chrome.runtime.lastError.message);
+              else respondOk({ dataUrl, format, fullPage: false });
+            });
+            return;
+          }
+          // Full-page path: try CDP first (single call, no stitching).
+          const numericTabId = parseInt(tabId, 10);
+          const sendCDP = (cmd, args) => new Promise((resolve, reject) => {
+            chrome.debugger.sendCommand({ tabId: numericTabId }, cmd, args || {}, (r) => {
+              if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+              else resolve(r);
+            });
+          });
+          const stitchFallback = () => {
+            // Scroll-and-stitch via content.js (chrome.tabs.captureVisibleTab
+            // looped while the script scrolls). Slower (2 captures/sec rate
+            // limit) but works without debugger access.
+            dlog('[RBC] page.screenshot fullPage: CDP path unavailable, using content-script scroll-stitch');
+            params = { ...(params || {}), fullPage: true };
+            forwardToContent();
+          };
+          const doCdp = async () => {
+            try {
+              const opts = { format, captureBeyondViewport: true };
+              if (quality !== undefined && format === 'jpeg') opts.quality = quality;
+              const r = await sendCDP('Page.captureScreenshot', opts);
+              try { chrome.debugger.detach({ tabId: numericTabId }); } catch (e) {}
+              if (!r?.data) { stitchFallback(); return; }
+              respondOk({ dataUrl: `data:image/${format};base64,${r.data}`, format, fullPage: true, source: 'cdp' });
+            } catch (e) {
+              try { chrome.debugger.detach({ tabId: numericTabId }); } catch (_) {}
+              stitchFallback();
+            }
+          };
+          chrome.debugger.attach({ tabId: numericTabId }, '1.3', () => {
+            if (chrome.runtime.lastError) {
+              if (chrome.runtime.lastError.message.includes('already attached')) { doCdp(); return; }
+              stitchFallback();
+              return;
+            }
+            doCdp();
           });
         });
         return;
+      }
 
       // eval.js / page.evaluate: run via chrome.debugger CDP to bypass strict CSP
       // pages (script-src 'none' etc.) where <script> injection from content.js fails.

@@ -581,8 +581,16 @@
       return { html: document.body.innerHTML };
     },
 
-    'page.screenshot': async ({ fullPage }) => {
-      // Helper: capture current viewport via background
+    'page.screenshot': async ({ fullPage, format, quality, maxHeight }) => {
+      // This handler is the FALLBACK for full-page captures (background.js
+      // tries CDP captureBeyondViewport first; if that fails — debugger
+      // blocked / not attached — it forwards here for scroll-and-stitch).
+      // For viewport-only captures, background.js handles directly via
+      // chrome.tabs.captureVisibleTab and never reaches this code.
+      const fmt = (format === 'jpeg') ? 'image/jpeg' : 'image/png';
+      const q = (typeof quality === 'number' && quality > 0 && quality <= 100) ? quality / 100 : 0.85;
+      const maxH = (typeof maxHeight === 'number' && maxHeight > 0) ? maxHeight : 12000; // safety cap
+
       const captureViewport = () => new Promise((resolve, reject) => {
         if (!isContextValid()) { reject(new Error('Extension context invalidated')); return; }
         try {
@@ -596,16 +604,20 @@
 
       if (!fullPage) {
         const dataUrl = await captureViewport();
-        return { screenshot: dataUrl };
+        return { screenshot: dataUrl, dataUrl, format: fmt === 'image/jpeg' ? 'jpeg' : 'png', fullPage: false };
       }
 
-      // Full-page: scroll-and-stitch
+      // Full-page: scroll-and-stitch.
+      // chrome.tabs.captureVisibleTab is rate-limited (~2 calls/sec in MV3),
+      // so we wait 600ms between captures to stay safely under that.
       const originalX = window.scrollX;
       const originalY = window.scrollY;
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       const fullWidth = Math.max(document.documentElement.scrollWidth, vw);
-      const fullHeight = Math.max(document.documentElement.scrollHeight, vh);
+      const fullHeightRaw = Math.max(document.documentElement.scrollHeight, vh);
+      const fullHeight = Math.min(fullHeightRaw, maxH);
+      const truncated = fullHeightRaw > maxH;
       const rows = Math.ceil(fullHeight / vh);
       const cols = Math.ceil(fullWidth / vw);
       const tiles = [];
@@ -613,24 +625,42 @@
       for (let row = 0; row < rows; row++) {
         for (let col = 0; col < cols; col++) {
           window.scrollTo(col * vw, row * vh);
-          await new Promise(r => setTimeout(r, 150));
-          const dataUrl = await captureViewport();
+          // Wait long enough to (a) let lazy-loaded content render and
+          // (b) stay under captureVisibleTab's rate limit.
+          await new Promise(r => setTimeout(r, 600));
+          let dataUrl;
+          try {
+            dataUrl = await captureViewport();
+          } catch (e) {
+            // Single tile failure shouldn't kill the whole capture; pad with
+            // empty tile and continue.
+            console.warn('[RBC] page.screenshot tile failed:', e.message);
+            continue;
+          }
           tiles.push({ dataUrl, x: col * vw, y: row * vh });
         }
       }
       window.scrollTo(originalX, originalY);
 
-      // Stitch on canvas
       const canvas = document.createElement('canvas');
       canvas.width = fullWidth;
       canvas.height = fullHeight;
       const ctx = canvas.getContext('2d');
       for (const tile of tiles) {
         const img = new Image();
-        await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = tile.dataUrl; });
-        ctx.drawImage(img, tile.x, tile.y);
+        try {
+          await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = tile.dataUrl; });
+          ctx.drawImage(img, tile.x, tile.y);
+        } catch (e) { console.warn('[RBC] page.screenshot stitch tile failed:', e.message); }
       }
-      return { screenshot: canvas.toDataURL('image/png'), fullWidth, fullHeight };
+      const out = canvas.toDataURL(fmt, fmt === 'image/jpeg' ? q : undefined);
+      return {
+        screenshot: out, dataUrl: out,
+        format: fmt === 'image/jpeg' ? 'jpeg' : 'png',
+        fullPage: true,
+        fullWidth, fullHeight,
+        ...(truncated ? { truncated: true, originalHeight: fullHeightRaw } : {}),
+      };
     },
 
     'page.getCookies': async () => {
