@@ -42,6 +42,39 @@ let savedConfig = null;
 /** Resolves once loadConfig() has finished — gates popup_status etc. */
 let initPromise = null;
 
+// ============= CDP Debugger Helpers =============
+
+/**
+ * chrome.debugger.attach wrapper that proactively cleans up our own prior
+ * session on the same target before attaching, so a stale leftover (from a
+ * previous request that crashed mid-flight, or from extension reload that
+ * left the previous attach reference dangling) doesn't masquerade as a
+ * "competing debugger" error.
+ *
+ * Note: this can ONLY clean up sessions owned by THIS extension. If another
+ * extension or DevTools has the debugger, the subsequent attach still fails
+ * with the usual "Cannot access" / "Another debugger is already attached" —
+ * caller-side fallback (stitchFallback / forwardToContent / etc.) handles that.
+ *
+ * The detach is idempotent in practice: if we don't own the session,
+ * Chrome returns "Debugger is not attached" via chrome.runtime.lastError —
+ * we swallow it and proceed to attach.
+ */
+function safeDebuggerAttach(target, version, callback) {
+  // Step 1: best-effort detach — only catches OUR own stale sessions.
+  chrome.debugger.detach(target, () => {
+    // Reading lastError consumes it so it doesn't pollute the next call.
+    const detachErr = chrome.runtime.lastError;
+    if (detachErr && !/not attached/i.test(detachErr.message || '')) {
+      // Other detach errors (e.g. "Tab does not exist") aren't fatal —
+      // attach below will report them more clearly.
+      dlog('[RBC] safeDebuggerAttach: detach pre-cleanup unusual error:', detachErr.message);
+    }
+    // Step 2: attach. Caller handles lastError as before.
+    chrome.debugger.attach(target, version, callback);
+  });
+}
+
 // ============= Connection Manager =============
 
 class RBCConnectionManager {
@@ -773,7 +806,7 @@ class RBCConnectionManager {
               stitchFallback();
             }
           };
-          chrome.debugger.attach({ tabId: numericTabId }, '1.3', () => {
+          safeDebuggerAttach({ tabId: numericTabId }, '1.3', () => {
             if (chrome.runtime.lastError) {
               if (chrome.runtime.lastError.message.includes('already attached')) { doCdp(); return; }
               stitchFallback();
@@ -836,7 +869,7 @@ class RBCConnectionManager {
                 respondOk({ result: result?.result?.value ?? null });
               });
           };
-          chrome.debugger.attach({ tabId: numericTabId }, '1.3', () => {
+          safeDebuggerAttach({ tabId: numericTabId }, '1.3', () => {
             if (chrome.runtime.lastError) {
               const msg = chrome.runtime.lastError.message || '';
               if (msg.includes('already attached')) { doEval(); return; }
@@ -954,7 +987,7 @@ class RBCConnectionManager {
               try { chrome.debugger.detach({ tabId: numericTabId }); } catch {}
             }
           };
-          chrome.debugger.attach({ tabId: numericTabId }, '1.3', () => {
+          safeDebuggerAttach({ tabId: numericTabId }, '1.3', () => {
             if (chrome.runtime.lastError) {
               if (chrome.runtime.lastError.message.includes('already attached')) { doFetch(); return; }
               respondErr(chrome.runtime.lastError.message); return;
@@ -1140,7 +1173,7 @@ class RBCConnectionManager {
               try { chrome.debugger.detach({ tabId: numericTabId }); } catch {}
             }
           };
-          chrome.debugger.attach({ tabId: numericTabId }, '1.3', () => {
+          safeDebuggerAttach({ tabId: numericTabId }, '1.3', () => {
             if (chrome.runtime.lastError) {
               if (chrome.runtime.lastError.message.includes('already attached')) { doClick(); return; }
               respondErr(chrome.runtime.lastError.message); return;
