@@ -857,23 +857,67 @@ class RBCConnectionManager {
           });
           const doClick = async () => {
             try {
-              // 1) Resolve coordinates of the element (scroll into view first).
+              // 1) Resolve coordinates of the element (scroll into view first) and
+              //    introspect its state so callers can distinguish "clicked" from
+              //    "fired into the void on a disabled / hidden / obscured target".
+              //
+              //    Coord-based CDP clicks are different from DOM .click():
+              //    - pointer-events:none on a target makes the click pass THROUGH
+              //      to whatever is underneath at (cx, cy) — must reject.
+              //    - off-screen coords land outside the viewport; the dispatched
+              //      mouse event hits nothing useful — must reject.
+              //    - opacity:0 is fine; opacity does not affect hit-testing.
               const expr = `(() => {
                 const el = document.querySelector(${JSON.stringify(selector)});
                 if (!el) return { found: false };
-                el.scrollIntoView({ block: 'center', inline: 'center' });
+                try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
                 const r = el.getBoundingClientRect();
-                return { found: true, x: r.left + r.width / 2, y: r.top + r.height / 2 };
+                const cs = getComputedStyle(el);
+                const zeroSize = r.width === 0 || r.height === 0;
+                const hidden = cs.visibility === 'hidden';
+                const pointerNone = cs.pointerEvents === 'none';
+                const visible = !zeroSize && !hidden;
+                const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
+                const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                const inViewport = cx >= 0 && cy >= 0 && cx < window.innerWidth && cy < window.innerHeight;
+                let obscuredBy = null;
+                if (visible && inViewport) {
+                  const top = document.elementFromPoint(cx, cy);
+                  if (top && top !== el && !el.contains(top) && !top.contains(el)) {
+                    const tt = (top.tagName || '').toLowerCase();
+                    const id = top.id ? '#' + top.id : '';
+                    const cls = (typeof top.className === 'string' && top.className)
+                      ? '.' + top.className.split(/\\s+/).filter(Boolean).slice(0, 2).join('.')
+                      : '';
+                    obscuredBy = tt + id + cls;
+                  }
+                }
+                return {
+                  found: true,
+                  x: cx, y: cy,
+                  tag: (el.tagName || '').toLowerCase(),
+                  disabled, zeroSize, hidden, pointerNone, visible, inViewport, obscuredBy,
+                  bbox: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+                };
               })()`;
               const evalRes = await sendCDP('Runtime.evaluate', { expression: expr, returnByValue: true });
               const v = evalRes?.result?.value;
               if (!v?.found) { respondErr(`Element not found: ${selector}`); return; }
-              const { x, y } = v;
+              const { x, y, tag, disabled, zeroSize, hidden, pointerNone, visible, inViewport, obscuredBy, bbox } = v;
+              const baseInfo = { found: true, tag, disabled, visible, inViewport, obscuredBy, bbox, x, y };
+              // Refuse to dispatch when the click would be meaningless or land
+              // on the wrong element — better to surface the failure than fire
+              // mouse events into the void.
+              if (disabled)    { respondOk({ ...baseInfo, success: false, reason: 'element is disabled' }); return; }
+              if (zeroSize)    { respondOk({ ...baseInfo, success: false, reason: 'element has zero size (display:none / detached / collapsed parent)' }); return; }
+              if (hidden)      { respondOk({ ...baseInfo, success: false, reason: 'element has visibility:hidden' }); return; }
+              if (pointerNone) { respondOk({ ...baseInfo, success: false, reason: 'element has pointer-events:none — CDP click would pass through to a different element' }); return; }
+              if (!inViewport) { respondOk({ ...baseInfo, success: false, reason: 'element still off-screen after scrollIntoView (parent may be overflow:hidden / position-fixed in unreachable spot)' }); return; }
               // 2) Trusted click — Chrome treats CDP-dispatched mouse events as user gestures.
               await sendCDP('Input.dispatchMouseEvent', { type: 'mouseMoved',    x, y });
               await sendCDP('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1 });
               await sendCDP('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
-              respondOk({ success: true, x, y });
+              respondOk({ ...baseInfo, success: true });
             } catch (e) {
               respondErr(e.message);
             } finally {

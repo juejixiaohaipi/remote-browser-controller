@@ -273,8 +273,48 @@
     // Element operations
     'element.click': async ({ selector }) => {
       const el = q(selector);
+      const tag = (el.tagName || '').toLowerCase();
+      // Bring target into view so (a) obscuredBy detection via elementFromPoint
+      // returns meaningful results, and (b) any IntersectionObserver-gated
+      // listeners on the page get a chance to attach.
+      try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+      const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
+      const rect = el.getBoundingClientRect();
+      const cs = window.getComputedStyle(el);
+      // visibility:hidden keeps the layout box (rect != 0) but blocks rendering;
+      // display:none is already implied by zero-size rect. opacity is NOT a
+      // visibility signal — opacity:0 elements (file-picker overlays, fade-in
+      // animations) are commonly clicked. pointer-events does NOT block DOM
+      // .click(); only mouse hit-testing — so it's irrelevant for this path.
+      const zeroSize = rect.width === 0 || rect.height === 0;
+      const hidden = cs.visibility === 'hidden';
+      const visible = !zeroSize && !hidden;
+      // obscuredBy: only meaningful when the click coordinate is actually
+      // inside the viewport — elementFromPoint outside viewport returns null,
+      // which would mask whether something is covering us.
+      let obscuredBy = null;
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const inViewport = cx >= 0 && cy >= 0 && cx < window.innerWidth && cy < window.innerHeight;
+      if (visible && inViewport) {
+        const top = document.elementFromPoint(cx, cy);
+        if (top && top !== el && !el.contains(top) && !top.contains(el)) {
+          const tt = (top.tagName || '').toLowerCase();
+          const id = top.id ? '#' + top.id : '';
+          const cls = (typeof top.className === 'string' && top.className)
+            ? '.' + top.className.split(/\s+/).filter(Boolean).slice(0, 2).join('.')
+            : '';
+          obscuredBy = tt + id + cls;
+        }
+      }
+      const bbox = { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) };
+      // Refuse on disabled / hidden — surface a structured result so callers
+      // (and the LLM agent) can decide what to do, rather than silently no-op.
+      if (disabled) return { success: false, found: true, tag, disabled: true, visible, inViewport, obscuredBy, bbox, reason: 'element is disabled' };
+      if (zeroSize) return { success: false, found: true, tag, disabled: false, visible: false, inViewport, obscuredBy, bbox, reason: 'element has zero size (display:none / detached / collapsed parent)' };
+      if (hidden)   return { success: false, found: true, tag, disabled: false, visible: false, inViewport, obscuredBy, bbox, reason: 'element has visibility:hidden' };
       el.click();
-      return { success: true };
+      return { success: true, found: true, tag, disabled: false, visible: true, inViewport, obscuredBy, bbox };
     },
 
     'element.type': async ({ selector, text, pressEnter }) => {
