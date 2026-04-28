@@ -274,29 +274,28 @@
     'element.click': async ({ selector }) => {
       const el = q(selector);
       const tag = (el.tagName || '').toLowerCase();
-      // Bring target into view so (a) obscuredBy detection via elementFromPoint
-      // returns meaningful results, and (b) any IntersectionObserver-gated
-      // listeners on the page get a chance to attach.
-      try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
-      const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
+      // Per HTMLElement.click() spec, the synthetic click is dispatched UNLESS
+      // the element is a form control that's disabled (then return without
+      // firing). visibility:hidden, opacity:0, pointer-events:none, off-screen,
+      // zero-size, aria-disabled — NONE of these block programmatic dispatch:
+      // listeners still fire. So the only true reject reason is form-disabled;
+      // everything else is informational and we still call el.click().
+      //
+      // We deliberately do NOT scrollIntoView here: el.click() is coordinate-
+      // independent, and forcing a scroll has UI side effects (closes sticky
+      // headers, blurs Chrome autofill, triggers lazy re-renders that detach
+      // the very element we're about to click).
+      const formDisabled = el.disabled === true;
       const rect = el.getBoundingClientRect();
       const cs = window.getComputedStyle(el);
-      // visibility:hidden keeps the layout box (rect != 0) but blocks rendering;
-      // display:none is already implied by zero-size rect. opacity is NOT a
-      // visibility signal — opacity:0 elements (file-picker overlays, fade-in
-      // animations) are commonly clicked. pointer-events does NOT block DOM
-      // .click(); only mouse hit-testing — so it's irrelevant for this path.
-      const zeroSize = rect.width === 0 || rect.height === 0;
-      const hidden = cs.visibility === 'hidden';
-      const visible = !zeroSize && !hidden;
-      // obscuredBy: only meaningful when the click coordinate is actually
-      // inside the viewport — elementFromPoint outside viewport returns null,
-      // which would mask whether something is covering us.
-      let obscuredBy = null;
       const cx = rect.left + rect.width / 2;
       const cy = rect.top + rect.height / 2;
-      const inViewport = cx >= 0 && cy >= 0 && cx < window.innerWidth && cy < window.innerHeight;
-      if (visible && inViewport) {
+      const inViewport = rect.width > 0 && rect.height > 0
+        && cx >= 0 && cy >= 0 && cx < window.innerWidth && cy < window.innerHeight;
+      // Best-effort overlay detection — only meaningful when target is inside
+      // viewport with non-zero hit area. Reported as info, never blocks.
+      let obscuredBy = null;
+      if (inViewport && cs.visibility !== 'hidden') {
         const top = document.elementFromPoint(cx, cy);
         if (top && top !== el && !el.contains(top) && !top.contains(el)) {
           const tt = (top.tagName || '').toLowerCase();
@@ -308,13 +307,23 @@
         }
       }
       const bbox = { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) };
-      // Refuse on disabled / hidden — surface a structured result so callers
-      // (and the LLM agent) can decide what to do, rather than silently no-op.
-      if (disabled) return { success: false, found: true, tag, disabled: true, visible, inViewport, obscuredBy, bbox, reason: 'element is disabled' };
-      if (zeroSize) return { success: false, found: true, tag, disabled: false, visible: false, inViewport, obscuredBy, bbox, reason: 'element has zero size (display:none / detached / collapsed parent)' };
-      if (hidden)   return { success: false, found: true, tag, disabled: false, visible: false, inViewport, obscuredBy, bbox, reason: 'element has visibility:hidden' };
+      if (formDisabled) {
+        return { success: false, found: true, tag, disabled: true, inViewport, obscuredBy, bbox,
+                 reason: 'element is form-disabled — HTMLElement.click() skips dispatch on form-disabled elements per spec' };
+      }
+      // Surface other suspicious states as warnings, but still fire — the
+      // click event WILL be dispatched and listeners will see it. The agent
+      // should decide based on observation whether the page actually reacted.
+      const warnings = [];
+      if (rect.width === 0 || rect.height === 0) warnings.push('zero-size (display:none / detached / collapsed parent) — listeners may have unhooked');
+      if (cs.visibility === 'hidden') warnings.push('visibility:hidden — element invisible but listeners still notified');
+      if (el.getAttribute('aria-disabled') === 'true') warnings.push('aria-disabled=true — semantic hint; some apps self-no-op such clicks');
+      if (!inViewport && rect.width > 0 && rect.height > 0) warnings.push('element off-screen — click dispatched programmatically; some listeners only attach when in view');
       el.click();
-      return { success: true, found: true, tag, disabled: false, visible: true, inViewport, obscuredBy, bbox };
+      return {
+        success: true, found: true, tag, disabled: false, inViewport, obscuredBy, bbox,
+        ...(warnings.length ? { warnings } : {}),
+      };
     },
 
     'element.type': async ({ selector, text, pressEnter }) => {
