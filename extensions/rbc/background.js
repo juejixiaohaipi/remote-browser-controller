@@ -469,24 +469,58 @@ class RBCConnectionManager {
     };
 
     // Helper: forward to content script
+    //
+    // Self-heals when the content script is missing — common after the
+    // extension is reloaded (existing tabs lose their content scripts and the
+    // declarative content_scripts entry only re-injects on next navigation).
+    // On the first "Receiving end does not exist" we use chrome.scripting to
+    // inject content.js into the tab and retry the send once.
     const forwardToContent = () => {
       resolveTab((tabId) => {
         if (!tabId) { respondErr('No active tab'); return; }
+        const numericTabId = parseInt(tabId, 10);
         dlog('[RBC] Forwarding to tab', tabId, ':', method);
-        let done = false;
-        const timeout = setTimeout(() => {
-          if (!done) { done = true; respondErr(`Timeout: ${method}`); }
-        }, 60000);
 
-        chrome.tabs.sendMessage(tabId, { type: 'execute', command: method, params: params || {} }, (resp) => {
-          dlog('[RBC] Tab response:', tabId, chrome.runtime.lastError?.message || 'ok', JSON.stringify(resp)?.slice(0, 500));
-          if (done) return;
-          done = true;
-          clearTimeout(timeout);
-          if (chrome.runtime.lastError) { respondErr(chrome.runtime.lastError.message); }
-          else if (resp?.error) { try { sendResponse({ id, error: resp.error }); } catch {} }
-          else { respondOk(resp); }
-        });
+        const send = (alreadyInjected) => {
+          let done = false;
+          const timeout = setTimeout(() => {
+            if (!done) { done = true; respondErr(`Timeout: ${method}`); }
+          }, 60000);
+
+          chrome.tabs.sendMessage(numericTabId, { type: 'execute', command: method, params: params || {} }, (resp) => {
+            dlog('[RBC] Tab response:', tabId, chrome.runtime.lastError?.message || 'ok', JSON.stringify(resp)?.slice(0, 500));
+            if (done) return;
+            const lastErrMsg = chrome.runtime.lastError?.message || '';
+
+            // Auto-inject the content script on missing-receiver and retry once.
+            // Don't auto-inject for restricted URLs (chrome://, web store) —
+            // that injection would just fail again with a clearer error.
+            if (!alreadyInjected && lastErrMsg.includes('Receiving end does not exist')) {
+              done = true;
+              clearTimeout(timeout);
+              dlog('[RBC] No content script in tab; injecting and retrying:', method);
+              chrome.scripting.executeScript(
+                { target: { tabId: numericTabId }, files: ['content.js'] },
+                () => {
+                  if (chrome.runtime.lastError) {
+                    respondErr(`content script injection failed: ${chrome.runtime.lastError.message}` +
+                      ` (tab may be on a restricted URL like chrome:// or the Chrome Web Store)`);
+                    return;
+                  }
+                  send(true);
+                }
+              );
+              return;
+            }
+
+            done = true;
+            clearTimeout(timeout);
+            if (chrome.runtime.lastError) { respondErr(lastErrMsg); }
+            else if (resp?.error) { try { sendResponse({ id, error: resp.error }); } catch {} }
+            else { respondOk(resp); }
+          });
+        };
+        send(false);
       });
     };
 

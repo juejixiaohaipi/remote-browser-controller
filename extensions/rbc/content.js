@@ -641,6 +641,181 @@
       return { storage: { ...localStorage } };
     },
 
+    // CDP-free DOM walk for interactive elements + page-level diagnostics
+    // (notices, focus, form grouping). Static content-script code — no eval,
+    // no chrome.debugger — so it keeps working when DevTools is open on the
+    // tab or another extension holds the debugger, and bypasses both
+    // extension and page CSP since it's loaded statically by the manifest.
+    'page.dom_tree': async () => {
+      const escapeId = (s) => (typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(s) : s);
+
+      // Best-effort stable selector: prefer #id, then [name], then a tag+role
+      // hint. Returns null if we can't synthesize anything useful.
+      const selectorFor = (el) => {
+        if (!el) return null;
+        if (el.id) return '#' + escapeId(el.id);
+        const name = el.getAttribute && el.getAttribute('name');
+        if (name) return `${el.tagName.toLowerCase()}[name="${name.replace(/"/g, '\\"')}"]`;
+        return null;
+      };
+
+      const isVisible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        const cs = getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+        return true;
+      };
+
+      // ── Walk interactive elements ─────────────────────────────────────
+      const out = [];
+      const all = document.querySelectorAll(
+        'a, button, input, select, textarea, [role="button"], [role="link"], ' +
+        '[role="checkbox"], [role="radio"], [role="combobox"], [role="textbox"], ' +
+        '[role="menuitem"], [role="tab"], summary, label[for]'
+      );
+      let idx = 0;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      for (const el of all) {
+        if (!(el instanceof HTMLElement)) continue;
+        if (!isVisible(el)) continue;
+        const r = el.getBoundingClientRect();
+        const tag = el.tagName.toLowerCase();
+        const inputType = tag === 'input' ? (el.type || 'text').toLowerCase() : null;
+        const role = el.getAttribute('role')
+          || (tag === 'a' ? 'link' : tag === 'button' ? 'button' : inputType ? inputType : '');
+        const name = (el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || el.getAttribute('title') || '').trim().slice(0, 80);
+        const id = el.id || '';
+        const value = (el.value || '').toString().slice(0, 40);
+        const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
+        const required = el.required === true || el.getAttribute('aria-required') === 'true';
+        const ariaInvalid = el.getAttribute('aria-invalid') === 'true';
+        const inViewport = r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
+        // Chrome :autofill pseudo-class lights up after password manager fills.
+        let autofilled = false;
+        try { autofilled = !!(el.matches && (el.matches(':autofill') || el.matches(':-webkit-autofill'))); } catch (e) {}
+        // checked state for checkbox/radio
+        const checked = (inputType === 'checkbox' || inputType === 'radio') ? !!el.checked : undefined;
+        const focused = document.activeElement === el;
+
+        out.push({
+          tag, role,
+          ...(id ? { id } : {}),
+          name, value,
+          ...(disabled ? { disabled: true } : {}),
+          ...(required ? { required: true } : {}),
+          ...(ariaInvalid ? { invalid: true } : {}),
+          ...(autofilled ? { autofilled: true } : {}),
+          ...(focused ? { focused: true } : {}),
+          ...(checked !== undefined ? { checked } : {}),
+          ...(inputType ? { inputType } : {}),
+          ...(el.getAttribute && el.getAttribute('autocomplete') ? { autocomplete: el.getAttribute('autocomplete') } : {}),
+          ...(el.getAttribute && el.getAttribute('placeholder') ? { placeholder: el.getAttribute('placeholder') } : {}),
+          ...(inViewport ? { inViewport: true } : {}),
+          selector: selectorFor(el),
+          box: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+        });
+        if (++idx >= 200) break;
+      }
+
+      // ── Page-level notices: alerts and validation messages ────────────
+      // These are typically how login pages surface failure ("Your password
+      // is incorrect"), captcha prompts, account-locked warnings, etc.
+      // Without this, the agent only sees the form and assumes idle state.
+      const notices = [];
+      const noticeSelectors = [
+        '[role="alert"]',
+        '[role="alertdialog"]',
+        '[aria-live="assertive"]',
+        '[aria-live="polite"]',
+        '[aria-invalid="true"]',
+        '.a-alert-content',         // Amazon-specific
+        '.a-alert-error',           // Amazon-specific
+        '.error', '.errorMessage', '.error-message',
+        '.warning', '.alert-danger', '.alert-warning',
+      ];
+      const seenNoticeText = new Set();
+      for (const sel of noticeSelectors) {
+        let matches;
+        try { matches = document.querySelectorAll(sel); } catch (e) { continue; }
+        for (const el of matches) {
+          if (!(el instanceof HTMLElement)) continue;
+          if (!isVisible(el)) continue;
+          const text = (el.innerText || el.textContent || '').trim().slice(0, 240);
+          if (!text || seenNoticeText.has(text)) continue;
+          // Skip notices that just mirror an interactive element's name (e.g.
+          // the alert IS the input wrapper) — keeps signal high.
+          if (text.length < 3) continue;
+          seenNoticeText.add(text);
+          const kind = sel.includes('alert') ? 'alert'
+            : sel.includes('invalid') ? 'invalid'
+            : sel.includes('warning') || sel.includes('warn') ? 'warning'
+            : sel.includes('error') ? 'error'
+            : 'alert';
+          notices.push({ kind, text, selector: selectorFor(el) });
+          if (notices.length >= 8) break;
+        }
+        if (notices.length >= 8) break;
+      }
+
+      // ── Focused element ────────────────────────────────────────────────
+      let focusedSelector = null;
+      let focusedTag = null;
+      const ae = document.activeElement;
+      if (ae && ae !== document.body && ae !== document.documentElement) {
+        focusedSelector = selectorFor(ae);
+        focusedTag = (ae.tagName || '').toLowerCase();
+      }
+
+      // ── Form grouping ─────────────────────────────────────────────────
+      // Tells the agent which inputs belong together (login form vs search
+      // form vs newsletter signup), so it doesn't fire blind across forms.
+      const forms = [];
+      const formNodes = document.querySelectorAll('form');
+      for (const form of formNodes) {
+        if (!isVisible(form)) continue;
+        const fields = form.querySelectorAll('input, textarea, select, button');
+        const fieldSelectors = [];
+        for (const f of fields) {
+          if (!isVisible(f)) continue;
+          const s = selectorFor(f);
+          if (s) fieldSelectors.push(s);
+          if (fieldSelectors.length >= 20) break;
+        }
+        if (fieldSelectors.length === 0) continue;
+        forms.push({
+          selector: selectorFor(form),
+          name: (form.getAttribute('name') || form.getAttribute('aria-label') || form.id || '').slice(0, 60),
+          action: form.getAttribute('action') || '',
+          fieldSelectors,
+        });
+        if (forms.length >= 6) break;
+      }
+
+      return {
+        count: out.length,
+        nodes: out,
+        notices,
+        focusedSelector,
+        focusedTag,
+        forms,
+        viewport: { w: vw, h: vh, scrollY: window.scrollY },
+      };
+    },
+
+    // Read .value or .textContent of the first element matching selector.
+    // Static, no eval — replaces the page.evaluate-based read path so it
+    // keeps working when CDP is blocked.
+    'element.read': async ({ selector }) => {
+      if (!selector) throw new Error('selector required');
+      const el = document.querySelector(selector);
+      if (!el) return { found: false, value: null };
+      const v = (el.value !== undefined && el.value !== null)
+        ? String(el.value)
+        : (el.textContent || '');
+      return { found: true, value: v, tag: (el.tagName || '').toLowerCase() };
+    },
+
     // NOTE: Normally intercepted by background.js (CDP Runtime.evaluate) to
     // bypass page CSP. This content-script fallback only runs if a caller sends
     // the command directly to the tab (e.g. chrome.tabs.sendMessage from another
