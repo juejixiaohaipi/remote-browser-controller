@@ -724,9 +724,17 @@ class RBCConnectionManager {
       //     visual fidelity, useful for long full-page captures.
       case 'page.screenshot': {
         const fullPage = !!params?.fullPage;
+        const annotate = !!params?.annotate;
         const format = (params?.format === 'jpeg') ? 'jpeg' : 'png';
         const quality = (typeof params?.quality === 'number' && params.quality > 0 && params.quality <= 100)
           ? params.quality : (format === 'jpeg' ? 80 : undefined);
+        // Annotate (= draw labeled boxes on top of interactive elements) requires
+        // DOM access for element bounding boxes, so route through content.js
+        // which captures viewport via runtime.sendMessage('capture_visible_tab')
+        // then composes the overlay on a canvas. Only viewport mode supports
+        // annotate today (full-page annotation would need to scale boxes to
+        // full-page coords; saved for later if needed).
+        if (annotate) { forwardToContent(); return; }
         resolveTab((tabId) => {
           if (!tabId) { respondErr('No active tab'); return; }
           if (!fullPage) {
@@ -945,18 +953,32 @@ class RBCConnectionManager {
           });
           const doClick = async () => {
             try {
-              // 1) Resolve coordinates of the element (scroll into view first) and
-              //    introspect its state so callers can distinguish "clicked" from
-              //    "fired into the void on a disabled / hidden / obscured target".
+              // Translate `e\d+` ref tokens (assigned by page.dom_tree, also
+              // tagged on the DOM as data-rbc-ref) into a plain attribute
+              // selector so this CDP path works the same as content-script
+              // resolution. CSS selectors pass through untouched.
+              const querySelectorArg = /^e\d+$/.test(selector)
+                ? `[data-rbc-ref="${selector}"]`
+                : selector;
+              const timeoutMs = (typeof params?.timeout === 'number' && params.timeout > 0) ? params.timeout : 5000;
+
+              // 1) Auto-wait: poll for an actionable state. Re-runs the same
+              //    actionability check up to timeoutMs at ~120ms cadence,
+              //    breaks early when the element exists, isn't disabled,
+              //    is visible, and isn't blocked by pointer-events:none.
+              //    Resolves three classes of timing problem:
+              //      - element appears after AJAX (not found → found)
+              //      - element gated until form valid (disabled → enabled)
+              //      - modal fades in (visibility:hidden → visible)
+              //    `obscuredBy` is reported but does NOT block — overlays
+              //    like cookie banners may need explicit dismissal.
               //
-              //    Coord-based CDP clicks are different from DOM .click():
-              //    - pointer-events:none on a target makes the click pass THROUGH
-              //      to whatever is underneath at (cx, cy) — must reject.
-              //    - off-screen coords land outside the viewport; the dispatched
-              //      mouse event hits nothing useful — must reject.
-              //    - opacity:0 is fine; opacity does not affect hit-testing.
+              //    Coord-based CDP clicks differ from DOM .click():
+              //    - pointer-events:none → click passes THROUGH to underlying element
+              //    - off-screen coords → mouse event lands nowhere useful
+              //    - opacity:0 is fine (opacity doesn't affect hit-testing)
               const expr = `(() => {
-                const el = document.querySelector(${JSON.stringify(selector)});
+                const el = document.querySelector(${JSON.stringify(querySelectorArg)});
                 if (!el) return { found: false };
                 try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
                 const r = el.getBoundingClientRect();
@@ -988,19 +1010,29 @@ class RBCConnectionManager {
                   bbox: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
                 };
               })()`;
-              const evalRes = await sendCDP('Runtime.evaluate', { expression: expr, returnByValue: true });
-              const v = evalRes?.result?.value;
-              if (!v?.found) { respondErr(`Element not found: ${selector}`); return; }
+
+              const startedAt = Date.now();
+              let v = null;
+              while (true) {
+                const evalRes = await sendCDP('Runtime.evaluate', { expression: expr, returnByValue: true });
+                v = evalRes?.result?.value || { found: false };
+                const actionable = v.found && !v.disabled && !v.zeroSize && !v.hidden && !v.pointerNone && v.inViewport;
+                if (actionable) break;
+                if (Date.now() - startedAt >= timeoutMs) break;
+                await new Promise(r => setTimeout(r, 120));
+              }
+              const elapsedMs = Date.now() - startedAt;
+              if (!v.found) { respondErr(`Element not found within ${timeoutMs}ms: ${selector}`); return; }
               const { x, y, tag, disabled, zeroSize, hidden, pointerNone, visible, inViewport, obscuredBy, bbox } = v;
-              const baseInfo = { found: true, tag, disabled, visible, inViewport, obscuredBy, bbox, x, y };
+              const baseInfo = { found: true, tag, disabled, visible, inViewport, obscuredBy, bbox, x, y, elapsed_ms: elapsedMs };
               // Refuse to dispatch when the click would be meaningless or land
               // on the wrong element — better to surface the failure than fire
               // mouse events into the void.
-              if (disabled)    { respondOk({ ...baseInfo, success: false, reason: 'element is disabled' }); return; }
-              if (zeroSize)    { respondOk({ ...baseInfo, success: false, reason: 'element has zero size (display:none / detached / collapsed parent)' }); return; }
-              if (hidden)      { respondOk({ ...baseInfo, success: false, reason: 'element has visibility:hidden' }); return; }
+              if (disabled)    { respondOk({ ...baseInfo, success: false, reason: `element still disabled after ${elapsedMs}ms wait` }); return; }
+              if (zeroSize)    { respondOk({ ...baseInfo, success: false, reason: `element still zero-size after ${elapsedMs}ms (display:none / detached / collapsed parent)` }); return; }
+              if (hidden)      { respondOk({ ...baseInfo, success: false, reason: `element still visibility:hidden after ${elapsedMs}ms` }); return; }
               if (pointerNone) { respondOk({ ...baseInfo, success: false, reason: 'element has pointer-events:none — CDP click would pass through to a different element' }); return; }
-              if (!inViewport) { respondOk({ ...baseInfo, success: false, reason: 'element still off-screen after scrollIntoView (parent may be overflow:hidden / position-fixed in unreachable spot)' }); return; }
+              if (!inViewport) { respondOk({ ...baseInfo, success: false, reason: `element still off-screen after ${elapsedMs}ms (parent may be overflow:hidden)` }); return; }
 
               // 2) Install click probe in the page so we can answer: did the
               //    event actually reach our target? was it isTrusted? did the
@@ -1008,7 +1040,7 @@ class RBCConnectionManager {
               //    Probe state is parked on window.__rbcClickProbe so the read
               //    step (which runs after CDP mouse events) can pick it up.
               const installExpr = `(() => {
-                const el = document.querySelector(${JSON.stringify(selector)});
+                const el = document.querySelector(${JSON.stringify(querySelectorArg)});
                 if (!el) return false;
                 const probe = {
                   fired: false, isTrusted: null, defaultPrevented: false, targetTag: null,

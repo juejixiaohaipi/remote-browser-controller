@@ -141,15 +141,17 @@
   function resolveElement(ref) {
     if (!ref) return null;
     if (/^e\d+$/.test(ref)) {
-      // Invalidate refs if URL changed since snapshot (SPA navigation)
-      if (snapshotState.snapshotUrl && snapshotState.snapshotUrl !== location.href) {
-        return null;
-      }
+      // Path 1: WeakMap (set by page.dom_tree). Fast, GC-aware.
       const weak = snapshotState.eRefMap.get(ref);
       const el = weak?.deref?.() || null;
-      // Guard against detached nodes
-      if (el && !el.isConnected) return null;
-      return el;
+      const sameUrl = !snapshotState.snapshotUrl || snapshotState.snapshotUrl === location.href;
+      if (el && el.isConnected && sameUrl) return el;
+      // Path 2: data-rbc-ref attribute (set alongside the WeakMap, but
+      // survives content-script reloads / works for CDP-side queries that
+      // share this codebase). Falls back here if the map was wiped or
+      // the URL changed but the page kept its DOM (rare).
+      try { return document.querySelector(`[data-rbc-ref="${ref}"]`) || null; }
+      catch (e) { return null; }
     }
     return document.querySelector(ref);
   }
@@ -271,8 +273,22 @@
 
   const handlers = {
     // Element operations
-    'element.click': async ({ selector }) => {
-      const el = q(selector);
+    'element.click': async ({ selector, timeout }) => {
+      // Auto-wait: poll for the element to exist and become non-form-disabled
+      // up to `timeout` ms (default 5000), at ~120ms cadence. Resolves common
+      // races: SPA route just changed, button gated until form valid, modal
+      // fading in. resolveElement() handles e\d+ refs + CSS selectors uniformly.
+      const timeoutMs = (typeof timeout === 'number' && timeout > 0) ? timeout : 5000;
+      const startedAt = Date.now();
+      let el = null;
+      while (true) {
+        el = resolveElement(selector);
+        if (el && el.disabled !== true) break;
+        if (Date.now() - startedAt >= timeoutMs) break;
+        await new Promise(r => setTimeout(r, 120));
+      }
+      if (!el) throw new Error(`Element not found within ${timeoutMs}ms: ${selector}`);
+      const elapsedMs = Date.now() - startedAt;
       const tag = (el.tagName || '').toLowerCase();
       // Per HTMLElement.click() spec, the synthetic click is dispatched UNLESS
       // the element is a form control that's disabled (then return without
@@ -309,7 +325,8 @@
       const bbox = { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) };
       if (formDisabled) {
         return { success: false, found: true, tag, disabled: true, inViewport, obscuredBy, bbox,
-                 reason: 'element is form-disabled — HTMLElement.click() skips dispatch on form-disabled elements per spec' };
+                 elapsed_ms: elapsedMs,
+                 reason: `element still form-disabled after ${elapsedMs}ms wait — HTMLElement.click() skips dispatch on form-disabled elements per spec` };
       }
       // Surface other suspicious states as warnings, but still fire — the
       // click event WILL be dispatched and listeners will see it.
@@ -358,6 +375,7 @@
       const pageReacted = urlChanged || htmlChanged || scrollChanged;
       return {
         success: true, found: true, tag, disabled: false, inViewport, obscuredBy, bbox,
+        elapsed_ms: elapsedMs,
         dispatched, isTrusted, defaultPrevented, targetTag,
         pageReacted, urlChanged, htmlChanged, scrollChanged,
         ...(warnings.length ? { warnings } : {}),
@@ -581,12 +599,12 @@
       return { html: document.body.innerHTML };
     },
 
-    'page.screenshot': async ({ fullPage, format, quality, maxHeight }) => {
+    'page.screenshot': async ({ fullPage, format, quality, maxHeight, annotate }) => {
       // This handler is the FALLBACK for full-page captures (background.js
       // tries CDP captureBeyondViewport first; if that fails — debugger
       // blocked / not attached — it forwards here for scroll-and-stitch).
-      // For viewport-only captures, background.js handles directly via
-      // chrome.tabs.captureVisibleTab and never reaches this code.
+      // It is also the PRIMARY path when `annotate: true` (viewport only) —
+      // because annotation needs DOM access for element bounding boxes.
       const fmt = (format === 'jpeg') ? 'image/jpeg' : 'image/png';
       const q = (typeof quality === 'number' && quality > 0 && quality <= 100) ? quality / 100 : 0.85;
       const maxH = (typeof maxHeight === 'number' && maxHeight > 0) ? maxHeight : 12000; // safety cap
@@ -602,9 +620,79 @@
         } catch (e) { reject(e); }
       });
 
+      // Helper: draw labeled bounding boxes for current ref-mapped elements
+      // on top of a viewport image. Returns a new dataUrl.
+      // Uses snapshotState.eRefMap which page.dom_tree populated on its last
+      // call — so a typical workflow is: page_observe (calls dom_tree) →
+      // page_screenshot({annotate: true}) → image arrives with [e1] [e2] …
+      // labeled on each interactive element. The agent can then click by ref.
+      const annotateViewport = async (sourceDataUrl) => {
+        const img = new Image();
+        await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = sourceDataUrl; });
+        const canvas = document.createElement('canvas');
+        // Capture is at devicePixelRatio scaling; account for it when matching
+        // logical CSS coords (DOM rects) to pixel coords on the captured image.
+        const dpr = (img.naturalWidth / window.innerWidth) || 1;
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        // Color palette: yellow stroke + label, ~50% transparent fill.
+        ctx.lineWidth = Math.max(2, Math.round(2 * dpr));
+        const labelFontPx = Math.max(11, Math.round(12 * dpr));
+        ctx.font = `bold ${labelFontPx}px sans-serif`;
+        ctx.textBaseline = 'top';
+        const labels = []; // collect for return value
+        // Walk the live ref map, drawing a box per element currently visible
+        // in the viewport.
+        for (const [ref, weak] of snapshotState.eRefMap.entries()) {
+          const el = weak?.deref?.();
+          if (!el || !el.isConnected) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          // Skip elements outside viewport — they're off the captured image.
+          if (r.bottom < 0 || r.top > window.innerHeight) continue;
+          if (r.right < 0 || r.left > window.innerWidth) continue;
+          const x = Math.round(r.left * dpr);
+          const y = Math.round(r.top * dpr);
+          const w = Math.round(r.width * dpr);
+          const h = Math.round(r.height * dpr);
+          // Box outline
+          ctx.strokeStyle = 'rgba(255, 200, 0, 0.95)';
+          ctx.fillStyle = 'rgba(255, 200, 0, 0.18)';
+          ctx.fillRect(x, y, w, h);
+          ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+          // Label "[e3]" badge in top-left corner, slightly inset
+          const labelText = `[${ref}]`;
+          const padX = Math.round(4 * dpr), padY = Math.round(2 * dpr);
+          const tw = ctx.measureText(labelText).width;
+          const lx = x; // anchor flush with box's top-left
+          const ly = y;
+          const lw = tw + padX * 2;
+          const lh = labelFontPx + padY * 2;
+          ctx.fillStyle = 'rgba(255, 200, 0, 0.95)';
+          ctx.fillRect(lx, ly, lw, lh);
+          ctx.fillStyle = '#000';
+          ctx.fillText(labelText, lx + padX, ly + padY);
+          labels.push({ ref, box: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) } });
+        }
+        const out = canvas.toDataURL(fmt, fmt === 'image/jpeg' ? q : undefined);
+        return { dataUrl: out, labels };
+      };
+
       if (!fullPage) {
-        const dataUrl = await captureViewport();
-        return { screenshot: dataUrl, dataUrl, format: fmt === 'image/jpeg' ? 'jpeg' : 'png', fullPage: false };
+        const raw = await captureViewport();
+        if (annotate) {
+          // Make sure the ref map reflects the current page; if dom_tree was
+          // never called (or was called on a different URL), do a quick
+          // implicit rebuild so the overlay isn't empty / stale.
+          if (snapshotState.eRefMap.size === 0 || snapshotState.snapshotUrl !== location.href) {
+            try { await handlers['page.dom_tree'](); } catch (e) { /* ignore — overlay just stays empty */ }
+          }
+          const { dataUrl: annotated, labels } = await annotateViewport(raw);
+          return { screenshot: annotated, dataUrl: annotated, format: fmt === 'image/jpeg' ? 'jpeg' : 'png', fullPage: false, annotated: true, labels };
+        }
+        return { screenshot: raw, dataUrl: raw, format: fmt === 'image/jpeg' ? 'jpeg' : 'png', fullPage: false };
       }
 
       // Full-page: scroll-and-stitch.
@@ -698,6 +786,22 @@
       };
 
       // ── Walk interactive elements ─────────────────────────────────────
+      // Each element gets a stable ref `e1`, `e2`, ... stored in
+      // snapshotState.eRefMap (WeakRef → element) AND tagged on the element
+      // as `data-rbc-ref="eN"`. Two storage paths because we need both:
+      //   - WeakMap → fast in-content-script resolution + GC of detached nodes
+      //   - data attribute → CDP Runtime.evaluate can't see content-script
+      //     closures, so trusted_click rewrites e\d+ → [data-rbc-ref="eN"]
+      //     and uses standard querySelector. Same ref works in both worlds.
+      // Stale attributes from the previous snapshot are scrubbed first.
+      try {
+        for (const old of document.querySelectorAll('[data-rbc-ref]')) {
+          old.removeAttribute('data-rbc-ref');
+        }
+      } catch (e) { /* best-effort cleanup */ }
+      snapshotState.eRefMap.clear();
+      snapshotState.nextId = 1;
+      snapshotState.snapshotUrl = location.href;
       const out = [];
       const all = document.querySelectorAll(
         'a, button, input, select, textarea, [role="button"], [role="link"], ' +
@@ -728,7 +832,14 @@
         const checked = (inputType === 'checkbox' || inputType === 'radio') ? !!el.checked : undefined;
         const focused = document.activeElement === el;
 
+        // Allocate a stable e\d+ ref and register it in the WeakMap +
+        // tag it on the DOM as a data attribute (so CDP-side code can see it).
+        const eRef = 'e' + snapshotState.nextId++;
+        snapshotState.eRefMap.set(eRef, new WeakRef(el));
+        try { el.setAttribute('data-rbc-ref', eRef); } catch (e) { /* sealed elements rare */ }
+
         out.push({
+          ref: eRef,
           tag, role,
           ...(id ? { id } : {}),
           name, value,
