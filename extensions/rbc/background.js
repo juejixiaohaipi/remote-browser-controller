@@ -913,11 +913,77 @@ class RBCConnectionManager {
               if (hidden)      { respondOk({ ...baseInfo, success: false, reason: 'element has visibility:hidden' }); return; }
               if (pointerNone) { respondOk({ ...baseInfo, success: false, reason: 'element has pointer-events:none — CDP click would pass through to a different element' }); return; }
               if (!inViewport) { respondOk({ ...baseInfo, success: false, reason: 'element still off-screen after scrollIntoView (parent may be overflow:hidden / position-fixed in unreachable spot)' }); return; }
-              // 2) Trusted click — Chrome treats CDP-dispatched mouse events as user gestures.
+
+              // 2) Install click probe in the page so we can answer: did the
+              //    event actually reach our target? was it isTrusted? did the
+              //    page react afterwards?
+              //    Probe state is parked on window.__rbcClickProbe so the read
+              //    step (which runs after CDP mouse events) can pick it up.
+              const installExpr = `(() => {
+                const el = document.querySelector(${JSON.stringify(selector)});
+                if (!el) return false;
+                const probe = {
+                  fired: false, isTrusted: null, defaultPrevented: false, targetTag: null,
+                  urlBefore: location.href,
+                  htmlSizeBefore: (document.body && document.body.innerHTML ? document.body.innerHTML.length : 0),
+                  scrollBefore: window.scrollY,
+                };
+                const handler = (e) => {
+                  if (e.composedPath().indexOf(el) !== -1) {
+                    probe.fired = true;
+                    probe.isTrusted = e.isTrusted;
+                    probe.defaultPrevented = e.defaultPrevented;
+                    probe.targetTag = (e.target && e.target.tagName ? e.target.tagName.toLowerCase() : null);
+                  }
+                };
+                window.__rbcClickProbe = probe;
+                window.__rbcClickProbeHandler = handler;
+                window.addEventListener('click', handler, { capture: true });
+                return true;
+              })()`;
+              await sendCDP('Runtime.evaluate', { expression: installExpr, returnByValue: true });
+
+              // 3) Trusted click — Chrome treats CDP-dispatched mouse events as user gestures.
               await sendCDP('Input.dispatchMouseEvent', { type: 'mouseMoved',    x, y });
               await sendCDP('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1 });
               await sendCDP('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
-              respondOk({ ...baseInfo, success: true });
+
+              // 4) Wait briefly for async page reactions and read the probe.
+              //    If navigation occurred, the probe object is gone — that is
+              //    itself a strong signal that the click had an effect.
+              const readExpr = `(async () => {
+                await new Promise(r => setTimeout(r, 400));
+                const p = window.__rbcClickProbe;
+                if (!p) {
+                  return { dispatched: true, navigated: true, urlAfter: location.href, note: 'probe missing — page navigated, fresh execution context' };
+                }
+                const urlChanged = location.href !== p.urlBefore;
+                const htmlSizeAfter = (document.body && document.body.innerHTML ? document.body.innerHTML.length : 0);
+                const htmlChanged = Math.abs(htmlSizeAfter - p.htmlSizeBefore) > 100;
+                const scrollChanged = window.scrollY !== p.scrollBefore;
+                try { window.removeEventListener('click', window.__rbcClickProbeHandler, true); } catch (e) {}
+                delete window.__rbcClickProbe;
+                delete window.__rbcClickProbeHandler;
+                return {
+                  dispatched: p.fired === true,
+                  isTrusted: p.isTrusted,
+                  defaultPrevented: p.defaultPrevented === true,
+                  targetTag: p.targetTag,
+                  urlChanged, htmlChanged, scrollChanged,
+                  pageReacted: urlChanged || htmlChanged || scrollChanged,
+                  urlAfter: location.href,
+                };
+              })()`;
+              let probe = {};
+              try {
+                const probeRes = await sendCDP('Runtime.evaluate', { expression: readExpr, awaitPromise: true, returnByValue: true });
+                probe = probeRes?.result?.value || {};
+              } catch (e) {
+                // Eval can fail if the page navigated and the execution
+                // context was destroyed. That itself signals a working click.
+                probe = { dispatched: true, navigated: true, note: 'read-probe eval failed — likely navigation: ' + e.message };
+              }
+              respondOk({ ...baseInfo, success: true, ...probe });
             } catch (e) {
               respondErr(e.message);
             } finally {

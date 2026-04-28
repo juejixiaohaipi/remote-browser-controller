@@ -312,16 +312,54 @@
                  reason: 'element is form-disabled — HTMLElement.click() skips dispatch on form-disabled elements per spec' };
       }
       // Surface other suspicious states as warnings, but still fire — the
-      // click event WILL be dispatched and listeners will see it. The agent
-      // should decide based on observation whether the page actually reacted.
+      // click event WILL be dispatched and listeners will see it.
       const warnings = [];
       if (rect.width === 0 || rect.height === 0) warnings.push('zero-size (display:none / detached / collapsed parent) — listeners may have unhooked');
       if (cs.visibility === 'hidden') warnings.push('visibility:hidden — element invisible but listeners still notified');
       if (el.getAttribute('aria-disabled') === 'true') warnings.push('aria-disabled=true — semantic hint; some apps self-no-op such clicks');
       if (!inViewport && rect.width > 0 && rect.height > 0) warnings.push('element off-screen — click dispatched programmatically; some listeners only attach when in view');
+
+      // ── Click probe ─────────────────────────────────────────────────────
+      // Install a window-capture listener BEFORE clicking so we can answer
+      // "was the click event actually dispatched on the page tree?" Capture
+      // phase on window fires before any handler on target/ancestors, so even
+      // if site code calls stopPropagation() we still observe it.
+      //
+      // We deliberately do NOT await an async observation window here: if
+      // el.click() triggers navigation (e.g. <input type="submit">), the
+      // content-script context is destroyed during the wait and the message
+      // port closes — the response never reaches background.js. Synchronous
+      // probe + sync URL/scroll diff is enough for diagnostic purposes; the
+      // LLM picks up the post-click DOM via the next page_observe anyway.
+      let dispatched = false;
+      let isTrusted = null;
+      let defaultPrevented = false;
+      let targetTag = null;
+      const probe = (e) => {
+        if (e.composedPath().indexOf(el) !== -1) {
+          dispatched = true;
+          isTrusted = e.isTrusted;
+          defaultPrevented = e.defaultPrevented;
+          targetTag = (e.target?.tagName || '').toLowerCase();
+        }
+      };
+      window.addEventListener('click', probe, { capture: true });
+      const urlBefore = location.href;
+      const htmlSizeBefore = document.body?.innerHTML?.length || 0;
+      const scrollBefore = window.scrollY;
       el.click();
+      // Listener fires synchronously during dispatch. Synchronous DOM
+      // mutations and same-task URL/scroll changes are already visible.
+      window.removeEventListener('click', probe, true);
+      const urlChanged = location.href !== urlBefore;
+      const htmlSizeAfter = document.body?.innerHTML?.length || 0;
+      const htmlChanged = Math.abs(htmlSizeAfter - htmlSizeBefore) > 100;
+      const scrollChanged = window.scrollY !== scrollBefore;
+      const pageReacted = urlChanged || htmlChanged || scrollChanged;
       return {
         success: true, found: true, tag, disabled: false, inViewport, obscuredBy, bbox,
+        dispatched, isTrusted, defaultPrevented, targetTag,
+        pageReacted, urlChanged, htmlChanged, scrollChanged,
         ...(warnings.length ? { warnings } : {}),
       };
     },
