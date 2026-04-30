@@ -946,10 +946,15 @@
 
     // Read .value or .textContent of the first element matching selector.
     // Static, no eval — replaces the page.evaluate-based read path so it
-    // keeps working when CDP is blocked.
+    // keeps working when CDP is blocked. Uses resolveElement so `eN` refs
+    // assigned by page.dom_tree work the same here as in element.click;
+    // before this, a bare `eN` was passed straight to querySelector and
+    // parsed as a tag selector, returning not-found and silently breaking
+    // any caller that expected ref-style lookup (e.g. server-side
+    // expected_text verification before element_click).
     'element.read': async ({ selector }) => {
       if (!selector) throw new Error('selector required');
-      const el = document.querySelector(selector);
+      const el = resolveElement(selector);
       if (!el) return { found: false, value: null };
       const v = (el.value !== undefined && el.value !== null)
         ? String(el.value)
