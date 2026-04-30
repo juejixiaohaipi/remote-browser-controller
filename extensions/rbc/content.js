@@ -793,15 +793,53 @@
       //   - data attribute → CDP Runtime.evaluate can't see content-script
       //     closures, so trusted_click rewrites e\d+ → [data-rbc-ref="eN"]
       //     and uses standard querySelector. Same ref works in both worlds.
-      // Stale attributes from the previous snapshot are scrubbed first.
-      try {
-        for (const old of document.querySelectorAll('[data-rbc-ref]')) {
-          old.removeAttribute('data-rbc-ref');
-        }
-      } catch (e) { /* best-effort cleanup */ }
-      snapshotState.eRefMap.clear();
-      snapshotState.nextId = 1;
+      //
+      // Refs PERSIST across dom_tree calls within the same URL. Earlier
+      // versions cleared the map and re-assigned eN sequentially every call,
+      // which silently invalidated any ref the agent had cached from a
+      // previous observe — leading to "use e52 → click hits an unrelated
+      // element" bugs. Now we recover existing refs from data-rbc-ref
+      // attributes, garbage-collect detached entries, and only mint new
+      // refs for newly-interactive elements. URL change still resets
+      // (different page = different element identity).
+      const urlChanged = snapshotState.snapshotUrl && snapshotState.snapshotUrl !== location.href;
+      if (urlChanged) {
+        try {
+          for (const old of document.querySelectorAll('[data-rbc-ref]')) {
+            old.removeAttribute('data-rbc-ref');
+          }
+        } catch (e) { /* best-effort cleanup */ }
+        snapshotState.eRefMap.clear();
+        snapshotState.nextId = 1;
+      }
       snapshotState.snapshotUrl = location.href;
+      // Re-establish WeakRefs from any data-rbc-ref attributes still in the
+      // DOM. Survives content-script reloads (Chrome occasionally drops
+      // closure state during long sessions) and ensures nextId stays
+      // monotone with whatever's already been stamped.
+      try {
+        let observedMax = 0;
+        for (const el of document.querySelectorAll('[data-rbc-ref]')) {
+          const ref = el.getAttribute('data-rbc-ref') || '';
+          const m = /^e(\d+)$/.exec(ref);
+          if (!m) { try { el.removeAttribute('data-rbc-ref'); } catch (e) {} continue; }
+          if (!snapshotState.eRefMap.has(ref)) {
+            snapshotState.eRefMap.set(ref, new WeakRef(el));
+          }
+          const n = parseInt(m[1], 10);
+          if (n > observedMax) observedMax = n;
+        }
+        if (observedMax + 1 > snapshotState.nextId) snapshotState.nextId = observedMax + 1;
+      } catch (e) { /* best-effort */ }
+      // Garbage-collect entries whose elements are detached / GC'd. Without
+      // this, eRefMap grows unboundedly across SPA navigation within a single
+      // URL (modal opens/closes, list items added/removed, etc.).
+      try {
+        for (const [ref, weak] of [...snapshotState.eRefMap]) {
+          const el = weak && weak.deref && weak.deref();
+          if (!el || !el.isConnected) snapshotState.eRefMap.delete(ref);
+        }
+      } catch (e) { /* best-effort */ }
       const out = [];
       const all = document.querySelectorAll(
         'a, button, input, select, textarea, [role="button"], [role="link"], ' +
@@ -832,11 +870,16 @@
         const checked = (inputType === 'checkbox' || inputType === 'radio') ? !!el.checked : undefined;
         const focused = document.activeElement === el;
 
-        // Allocate a stable e\d+ ref and register it in the WeakMap +
-        // tag it on the DOM as a data attribute (so CDP-side code can see it).
-        const eRef = 'e' + snapshotState.nextId++;
-        snapshotState.eRefMap.set(eRef, new WeakRef(el));
-        try { el.setAttribute('data-rbc-ref', eRef); } catch (e) { /* sealed elements rare */ }
+        // Reuse an already-assigned ref if the element still has one and
+        // it's the entry we recorded. Only mint a new ref when the element
+        // is new (or its prior ref was garbage-collected). This is what
+        // makes refs stable across observes within the same URL.
+        let eRef = el.getAttribute('data-rbc-ref') || '';
+        if (!/^e\d+$/.test(eRef) || !snapshotState.eRefMap.has(eRef)) {
+          eRef = 'e' + snapshotState.nextId++;
+          snapshotState.eRefMap.set(eRef, new WeakRef(el));
+          try { el.setAttribute('data-rbc-ref', eRef); } catch (e) { /* sealed elements rare */ }
+        }
 
         out.push({
           ref: eRef,
